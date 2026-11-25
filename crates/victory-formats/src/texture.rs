@@ -598,7 +598,8 @@ impl Layout {
     /// Copies one subresource out of tiled memory (the whole texture,
     /// [`Layout::reach`] bytes of the mip at least) into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
-    /// `row_pitch` bytes apart, depth slices `depth_pitch`.
+    /// `row_pitch` bytes apart. For a mip with multiple depth slices,
+    /// `depth_pitch` must span the last active row of a slice.
     pub fn detile(
         &self,
         tiled: &[u8],
@@ -658,13 +659,18 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
-        let need = (depth as usize - 1)
-            .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
-            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
+        let slice_len = (m.height as usize - 1)
+            .checked_mul(row_pitch)
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
-        if tiled_len < self.reach(mip) as usize || linear_len < need || row_pitch < bytes {
+        if row_pitch < bytes || (depth > 1 && depth_pitch < slice_len) {
+            return Err(Error::TooSmall);
+        }
+        let need = (depth as usize - 1)
+            .checked_mul(depth_pitch)
+            .and_then(|offset| offset.checked_add(slice_len))
+            .ok_or(Error::TooSmall)?;
+        if tiled_len < self.reach(mip) as usize || linear_len < need {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
@@ -1080,6 +1086,42 @@ mod tests {
             layout.detile(&tiled, 0, 0, &mut linear, 16, usize::MAX),
             Err(Error::TooSmall)
         );
+    }
+
+    #[test]
+    fn volume_depth_pitch_must_cover_the_last_active_row() {
+        let pixels = [1, 2, 0xcc, 0xcc, 3, 4, 5, 6, 0xcc, 0xcc, 7, 8];
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex3d,
+                depth: 2,
+                ..desc(2, 2, 2, 1, swizzle)
+            })
+            .unwrap();
+            let mut tiled = vec![0xaa; layout.size as usize];
+            let mut back = [0xcc; 12];
+            for pitch in [0, 5] {
+                assert_eq!(
+                    layout.tile(&mut tiled, 0, 0, &pixels, 4, pitch),
+                    Err(Error::TooSmall)
+                );
+                assert!(tiled.iter().all(|&b| b == 0xaa));
+                assert_eq!(
+                    layout.detile(&tiled, 0, 0, &mut back, 4, pitch),
+                    Err(Error::TooSmall)
+                );
+                assert_eq!(back, [0xcc; 12]);
+            }
+            // The next slice may start immediately after the last active pixel.
+            layout.tile(&mut tiled, 0, 0, &pixels, 4, 6).unwrap();
+            layout.detile(&tiled, 0, 0, &mut back, 4, 6).unwrap();
+            assert_eq!(back, pixels);
+            // Mip 1 has only one slice and needs no depth pitch.
+            layout.tile(&mut tiled, 1, 0, &[42], 1, 0).unwrap();
+            let mut mip = [0];
+            layout.detile(&tiled, 1, 0, &mut mip, 1, 0).unwrap();
+            assert_eq!(mip, [42]);
+        }
     }
 
     #[test]
