@@ -13,8 +13,16 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the host's runtime stride table is bound: `t0` in this space
-/// (one `u32` element stride per view-heap slot).
+/// (one `u32` element stride per view-heap slot, [`VIEW_STRIDE_BITS`], with
+/// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats).
 pub const STRIDE_SPACE: u32 = 2;
+/// The bits of a stride-table dword holding the stride.
+pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// In a stride-table dword: a typed buffer view of an integer format
+/// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
+pub const VIEW_INTEGER: u32 = 1 << 31;
+/// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
+pub const VIEW_SIGNED: u32 = 1 << 30;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -93,6 +101,8 @@ pub(crate) struct Shader {
     pub root_uavs_shared: bool,
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
     pub stride_table: Option<V>,
+    /// The heap index each typed buffer handle (kind 10) from the heap was made from.
+    pub view_index: std::collections::HashMap<V, V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -155,6 +165,7 @@ impl Shader {
             root_uavs: Vec::new(),
             root_uavs_shared: false,
             stride_table: None,
+            view_index: std::collections::HashMap::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -471,7 +482,11 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        if !sampler && props.0 & 0xFF == 10 {
+            self.view_index.insert(h, index);
+        }
+        h
     }
 
     /// The finished container.

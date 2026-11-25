@@ -81,6 +81,8 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod d16_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(test)]
 mod memory_tests;
@@ -117,7 +119,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use rectangle::rectangle_geometry;
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED,
+    VIEW_STRIDE_BITS,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -2801,6 +2806,130 @@ mod packed_half_tests {
         assert!(count(&high, "2.000000e+00") > count(&low, "2.000000e+00"), "omod");
         let clamp = "dx.op.unary.f32(i32 7";
         assert!(count(&high, clamp) > count(&low, clamp), "clamp");
+    }
+
+    /// A compute program of user data s4 a table with one typed buffer UAV,
+    /// lowered: `d16` makes it `buffer_load_format_d16_xyzw v[4:5], v0`,
+    /// `buffer_store_format_d16_xyzw v[4:5], v0` (the element of the lane
+    /// read and written back), else the 32-bit forms on v[4:7].
+    fn typed_round_trip(d16: bool) -> super::lower::Lowered {
+        let (load, store) = if d16 {
+            ([0xE20C_2000, 0x8002_0400], [0xE21C_2000, 0x8002_0400])
+        } else {
+            ([0xE00C_2000, 0x8002_0400], [0xE01C_2000, 0x8002_0400])
+        };
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            load[0],
+            load[1],
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            store[0],
+            store[1],
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![crate::UsedResource {
+                kind: crate::ResourceType::Uav,
+                root: crate::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            target: crate::emit::Target::ANY,
+            psv: None,
+            console_cf: false,
+            per_lane_only: false,
+        })
+        .unwrap()
+    }
+
+    /// 16-bit typed buffer loads and stores (`_d16`) read their view's format
+    /// kind from the stride table and pick bits or a half conversion by it:
+    /// GFX10 converts by the view's format, and an integer view's 16 bits
+    /// pass as they are (the title's face network keeps its halves
+    /// in UINT views). Read through `dxc -dumpbin` (`VICTORY_PC_DXC`, else
+    /// the Windows SDK's); skipped without one.
+    #[test]
+    fn d16_typed_buffer_accesses_pick_bits_by_the_views_format_kind() {
+        let dxc = std::env::var_os("VICTORY_PC_DXC").map(std::path::PathBuf::from);
+        #[cfg(windows)]
+        let dxc = dxc.or_else(|| Some(validator::Validator::default_path()?.with_file_name("dxc.exe")));
+        let Some(dxc) = dxc.filter(|p| p.exists()) else {
+            return eprintln!("no dxc; DXIL check skipped");
+        };
+        let dump = |d16: bool| {
+            let file = std::env::temp_dir()
+                .join(format!("victory-d16-typed-{}-{d16}.dxil", std::process::id()));
+            std::fs::write(&file, typed_round_trip(d16).dxil).unwrap();
+            let out = std::process::Command::new(&dxc).arg("-dumpbin").arg(&file).output().unwrap();
+            let _ = std::fs::remove_file(&file);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let (d16, wide) = (dump(true), dump(false));
+        let count = |text: &str, what: &str| text.matches(what).count();
+        let table = "dx.op.rawBufferLoad.f32(i32 139";
+        // The load and the store each read their view's dword of the table.
+        assert_eq!(count(&d16, table), count(&wide, table) + 2, "{d16}");
+        // Integer by the load and the store; signed by the store only.
+        for (kind, n) in [(VIEW_INTEGER, 2), (VIEW_SIGNED, 1)] {
+            let mask = format!(", {}\n", kind as i32);
+            assert_eq!(count(&d16, &mask), n, "the kind bits tested: {d16}");
+        }
+        // Load: per channel the low 16 bits or the half; store: per channel
+        // zero- or sign-extended, then that or the widened half.
+        assert_eq!(count(&d16, "select i1"), 4 + 2 * 4, "{d16}");
+        assert_eq!(count(&d16, "ashr i32"), 4, "sign extension: {d16}");
+        assert_eq!(count(&d16, "dx.op.legacyF32ToF16(i32 130"), 4, "{d16}");
+        assert_eq!(count(&d16, "dx.op.legacyF16ToF32(i32 131"), 4, "{d16}");
+        assert_eq!(count(&wide, "select i1"), 0, "32-bit accesses convert nothing: {wide}");
     }
 
     #[test]
