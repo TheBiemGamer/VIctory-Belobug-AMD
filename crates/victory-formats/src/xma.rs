@@ -286,21 +286,44 @@ fn log2(v: usize) -> u32 {
 fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
     let n = input.len();
     let m = n / 2;
-    let mut re = vec![0f64; m];
-    let mut im = vec![0f64; m];
+    let twiddles = &imdct_twiddles()[log2(n) as usize - 7];
+    let mut re_buf = [0f64; FRAME_SAMPLES / 2];
+    let mut im_buf = [0f64; FRAME_SAMPLES / 2];
+    let (re, im) = (&mut re_buf[..m], &mut im_buf[..m]);
     for k in 0..m {
         let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
-        let (s, c) = (-std::f64::consts::PI * k as f64 / n as f64).sin_cos();
+        let (s, c) = twiddles.pre[k];
         (re[k], im[k]) = (a * c - b * s, a * s + b * c);
     }
-    fft(&mut re, &mut im);
+    fft(re, im);
     for k in 0..m {
-        let (s, c) = (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos();
+        let (s, c) = twiddles.post[k];
         let (wr, wi) = (re[k] * c - im[k] * s, re[k] * s + im[k] * c);
         // DCT-IV: c[2k] = Re, c[n-1-2k] = -Im; output j is c[n-1-j].
         out[n - 1 - 2 * k] = (wr as f32) * scale;
         out[2 * k] = -(wi as f32) * scale;
     }
+}
+
+/// The `(sin, cos)` factors `imdct_half` applies before and after its FFT.
+struct Twiddles {
+    pre: Vec<(f64, f64)>,
+    post: Vec<(f64, f64)>,
+}
+
+impl Twiddles {
+    fn new(n: usize) -> Self {
+        let pre = (0..n / 2).map(|k| (-std::f64::consts::PI * k as f64 / n as f64).sin_cos());
+        let post = (0..n / 2).map(|k| (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos());
+        Twiddles { pre: pre.collect(), post: post.collect() }
+    }
+}
+
+/// Twiddles for transforms of 128, 256 and 512 coefficients; they depend
+/// only on the size, so they are worked out once, not per subframe.
+fn imdct_twiddles() -> &'static [Twiddles; 3] {
+    static TWIDDLES: OnceLock<[Twiddles; 3]> = OnceLock::new();
+    TWIDDLES.get_or_init(|| [Twiddles::new(128), Twiddles::new(256), Twiddles::new(512)])
 }
 
 /// In-place radix-2 forward DFT (`exp(-2πi nk/N)`).
@@ -1061,6 +1084,47 @@ mod tests {
                     .sum::<f64>() as f32)
             })
             .collect()
+    }
+
+    /// `imdct_half` as it was before its twiddles were cached.
+    fn imdct_half_uncached(input: &[f32], out: &mut [f32], scale: f32) {
+        let n = input.len();
+        let m = n / 2;
+        let mut re = vec![0f64; m];
+        let mut im = vec![0f64; m];
+        for k in 0..m {
+            let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
+            let (s, c) = (-std::f64::consts::PI * k as f64 / n as f64).sin_cos();
+            (re[k], im[k]) = (a * c - b * s, a * s + b * c);
+        }
+        fft(&mut re, &mut im);
+        for k in 0..m {
+            let (s, c) = (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos();
+            let (wr, wi) = (re[k] * c - im[k] * s, re[k] * s + im[k] * c);
+            out[n - 1 - 2 * k] = (wr as f32) * scale;
+            out[2 * k] = -(wi as f32) * scale;
+        }
+    }
+
+    #[test]
+    fn cached_twiddles_give_the_same_bits() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * 1000.0
+        };
+        for n in [128usize, 256, 512] {
+            for _ in 0..50 {
+                let input: Vec<f32> = (0..n).map(|_| next()).collect();
+                let scale = 2.0 / n as f32 / 32768.0;
+                let (mut new, mut old) = (vec![0f32; n], vec![0f32; n]);
+                imdct_half(&input, &mut new, scale);
+                imdct_half_uncached(&input, &mut old, scale);
+                assert!(new.iter().zip(&old).all(|(a, b)| a.to_bits() == b.to_bits()), "n {n}");
+            }
+        }
     }
 
     #[test]
