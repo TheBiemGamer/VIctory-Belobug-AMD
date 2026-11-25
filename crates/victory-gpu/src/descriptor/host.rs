@@ -182,6 +182,12 @@ struct Bindless {
     uses: BTreeMap<u32, SlotUse>,
     /// Of them, those with work at each submission.
     busy: BTreeSet<u32>,
+    /// Of them, those writing memory or with a bounce.
+    writers: BTreeSet<u32>,
+    /// A slot made since the reads were last listed reads outside them.
+    reads_lack: bool,
+    /// The frame (plus one) the reads were last listed in.
+    reads_built: u64,
     /// Subset of `uses` currently marked unmapped (checked on memory remap).
     unmapped_slots: std::collections::HashSet<u32>,
     /// Subset of `uses` holding a direct-memory window (checked for `is_dead`).
@@ -561,7 +567,7 @@ const SAMPLER_DYNAMIC: u32 = 256;
 /// their results applied, the whole plan built again), the microseconds,
 /// the times it ran, the items it walked and those it found, summed and
 /// logged every 64 presented frames.
-static PLAN_NOTES: [[AtomicU64; 4]; 9] = [const { [const { AtomicU64::new(0) }; 4] }; 9];
+static PLAN_NOTES: [[AtomicU64; 4]; 10] = [const { [const { AtomicU64::new(0) }; 4] }; 10];
 static PLAN_FRAME: AtomicU64 = AtomicU64::new(0);
 /// Slots the plan lacked something for, by what: bit 0 another write, bit 1
 /// another bounce, bit 2 a read outside the plan.
@@ -631,7 +637,7 @@ fn plan_note(part: usize, started: std::time::Instant, walked: usize, found: usi
         && PLAN_FRAME.compare_exchange(last, frame, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     {
         let frames = (frame - last).max(1) as f64;
-        const NAMES: [&str; 9] = ["direct slots", "all slots listed", "stale views", "slots made", "results applied", "whole plan", "differing (found: lacking)", "lacking a write (found: a bounce)", "lacking a read (found: gone with a write or bounce)"];
+        const NAMES: [&str; 10] = ["direct slots", "all slots listed", "stale views", "slots made", "results applied", "whole plan", "differing (found: lacking)", "lacking a write (found: a bounce)", "lacking a read (found: gone with a write or bounce)", "writes only"];
         let mut text = String::new();
         for (name, n) in NAMES.iter().zip(&PLAN_NOTES) {
             let [us, runs, walked, found] = [0, 1, 2, 3].map(|k| n[k].swap(0, Ordering::Relaxed));
@@ -1298,6 +1304,7 @@ impl HostHeap {
     fn drop_bindless(&self, b: &mut Bindless, index: u32, entry: Option<(u32, u32)>) {
         b.uses.remove(&index);
         b.busy.remove(&index);
+        b.writers.remove(&index);
         b.unmapped_slots.remove(&index);
         b.direct_slots.remove(&index);
         b.recorded.remove(&index);
@@ -1945,7 +1952,10 @@ impl HostHeap {
                 let new = made.as_ref().and_then(|m| m.1.as_ref());
                 let mut bits = 0u8;
                 let lacks = match (new, &planned) {
-                    (_, None) => true,
+                    (_, None) => {
+                        b.reads_lack = true;
+                        true
+                    }
                     (Some(new), Some(reads)) => {
                         let lacking = [
                             !same_range(&new.write, wrote),
@@ -1956,6 +1966,7 @@ impl HostHeap {
                             *n += usize::from(l);
                         }
                         bits |= u8::from(lacking[0]) | u8::from(lacking[1]) << 1 | u8::from(lacking[2]) << 2;
+                        b.reads_lack |= lacking[2];
                         lacking.contains(&true)
                     }
                     (None, Some(_)) => {
@@ -1973,19 +1984,21 @@ impl HostHeap {
                         }
                     }
                 }
+                // Held until the reads are listed again, by either kind of build.
+                let held = new.filter(|n| n.read.is_some()).and_then(|n| n.retained.clone());
+                b.extra.extend(held);
                 if lacks {
                     added += 1;
                     changed = true;
                 } else {
                     b.loose = true;
-                    let held = new.filter(|n| n.read.is_some()).and_then(|n| n.retained.clone());
-                    b.extra.extend(held);
                 }
             }
             match made {
                 None => {
                     b.uses.remove(&index);
                     b.busy.remove(&index);
+                    b.writers.remove(&index);
                     b.unmapped_slots.remove(&index);
                     b.direct_slots.remove(&index);
                 }
@@ -2001,6 +2014,11 @@ impl HostHeap {
                         b.busy.insert(index);
                     } else {
                         b.busy.remove(&index);
+                    }
+                    if u.write.is_some() || u.bounce.is_some() {
+                        b.writers.insert(index);
+                    } else {
+                        b.writers.remove(&index);
                     }
                     if u.unmapped {
                         b.unmapped_slots.insert(index);
@@ -2049,7 +2067,40 @@ impl HostHeap {
             return Some(plan);
         }
         b.full = (frame, false);
+        // No slot reads outside the plan: keep its reads (loose) and list only writes and
+        // bounces. Listing all 80,000 reads for the ~45 slots a frame that write elsewhere took 15 ms.
+        if reuse()
+            && !cfg!(test)
+            && !b.reads_lack
+            && frame < b.reads_built + LOOSE_FRAMES
+            && let Some(old) = &b.plan
+        {
+            let t = std::time::Instant::now();
+            let (mut writes, mut bounces) = (Vec::new(), Vec::new());
+            for u in b.writers.iter().filter_map(|i| b.uses.get(i)) {
+                writes.extend(u.write.clone());
+                bounces.extend(u.bounce);
+            }
+            bounces.sort_unstable_by_key(|b| b.1);
+            let n_writers = b.writers.len();
+            let plan = Arc::new(BindlessPlan {
+                reads: old.reads.clone(),
+                writes: Arc::new(merged(writes, 0)),
+                bounces: Arc::new(bounces),
+                fresh,
+                fresh_reads,
+                copied_in: AtomicU64::new(0),
+                _retained: old._retained.clone(),
+                _extra: b.extra.clone(),
+            });
+            b.loose = true;
+            b.plan = Some(plan.clone());
+            plan_note(9, t, n_writers, 0);
+            return Some(plan);
+        }
         b.loose = false;
+        b.reads_lack = false;
+        b.reads_built = frame;
         b.extra.clear();
         let t_full = std::time::Instant::now();
         let (mut reads, mut writes, mut bounces, mut retained) =

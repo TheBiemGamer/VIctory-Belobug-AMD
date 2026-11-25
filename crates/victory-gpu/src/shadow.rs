@@ -1324,16 +1324,17 @@ fn through_another_view(
 /// staging together ran it out seconds into the world and every allocation
 /// after that failed (#147). Such a window is copied instead, as memory the
 /// host GPU cannot use in place is. The share is
-/// `VICTORY_IN_PLACE_SYSTEM_PERCENT` (50 by default; 100 turns the check off).
+/// `VICTORY_IN_PLACE_SYSTEM_PERCENT` (100 turns the check off); 50 by default,
+/// 85 from a 12 GiB budget, where 50 made a 32 GB machine copy 155 MB a frame.
 fn over_system_budget(len: u64) -> bool {
-    static PERCENT: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    static PERCENT: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
         std::env::var("VICTORY_IN_PLACE_SYSTEM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(50, |p| p.min(100))
+            .map(|p| p.min(100))
     });
     // Off: the driver is not asked either.
-    if *PERCENT >= 100 {
+    if PERCENT.is_some_and(|p| p >= 100) {
         return false;
     }
     let Some([_, (used, budget)]) = crate::host::video_memory() else {
@@ -1342,7 +1343,8 @@ fn over_system_budget(len: u64) -> bool {
     if budget == 0 {
         return false;
     }
-    let over = used.saturating_add(len) > budget / 100 * *PERCENT;
+    let percent = PERCENT.unwrap_or(if budget >= 12 << 30 { 85 } else { 50 });
+    let over = used.saturating_add(len) > budget / 100 * percent;
     if over {
         static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
