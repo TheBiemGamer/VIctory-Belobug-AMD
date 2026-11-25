@@ -505,13 +505,7 @@ fn emit_program(
             .samplers
             .iter()
             .enumerate()
-            .map(|(n, &w)| {
-                let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
-                }
-                s
-            })
+            .map(|(n, &w)| static_sampler(w, l.cmp_samplers >> n & 1 != 0))
             .collect(),
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
@@ -519,6 +513,18 @@ fn emit_program(
         root_uavs: l.root_uavs,
         stride_table: l.stride_table,
     })
+}
+
+/// Immediate sampler `w` as the host's; `compares` when a sampling
+/// instruction compares through it, which takes the comparison reduction
+/// in place of any minimum or maximum one (0x80 or'd into 0x100 was 0x180,
+/// the maximum).
+fn static_sampler(w: [u32; 4], compares: bool) -> StaticSampler {
+    let mut s = StaticSampler::from_words(w);
+    if compares {
+        s.filter = s.filter & !0x180 | 0x80;
+    }
+    s
 }
 
 /// Interpolation modes of the input (for pixel) or output (for vertex/mesh)
@@ -706,6 +712,21 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// A comparison through an immediate sampler with a minimum, maximum
+    /// or no reduction is a comparison sampler, its filter kept.
+    #[test]
+    fn comparing_samplers_take_the_comparison_reduction() {
+        // Word 0 bits 29-30: reduction (1 minimum, 2 maximum); word 2: linear
+        // mag and min (bits 20, 22).
+        let linear = 1 << 20 | 1 << 22;
+        for reduction in [0u32, 1, 2] {
+            let s = super::static_sampler([reduction << 29, 0, linear, 0], true);
+            assert_eq!(s.filter, 0x94, "reduction {reduction}");
+            let plain = super::static_sampler([reduction << 29, 0, linear, 0], false);
+            assert_eq!(plain.filter, 0x14 | [0, 0x100, 0x180][reduction as usize]);
+        }
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
