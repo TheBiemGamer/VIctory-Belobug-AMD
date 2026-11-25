@@ -15,7 +15,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -1291,6 +1291,8 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let half_inputs = half_inputs(&x.native.io, &x.inputs);
+        let half_input_spills = half_input_spills(&half_inputs, &x.inputs);
         Lower {
             s,
             x,
@@ -1338,8 +1340,8 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
-            half_inputs: half_inputs(&x.native.io, &x.inputs),
-            half_input_spills: half_input_spills(&half_inputs(&x.native.io, &x.inputs), &x.inputs),
+            half_inputs,
+            half_input_spills,
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs | HwStage::Ms => MaskData::Host,
@@ -5449,8 +5451,6 @@ impl<'a> Lower<'a> {
                 _ => Err(name),
             };
         }
-        let m = &mut self.s.m;
-        let _ = m;
         let (r, carry): (V, Option<V>) = match name {
             "s_mov_b32" => (src32(self, 0)?, None),
             "s_movk_i32" => (sext16(self), None),
@@ -6884,7 +6884,6 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 // Each predecessor computes its heap index at its end; the
                 // join picks one with a phi.
-                let _ = site;
                 let mut incoming = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
@@ -8117,18 +8116,6 @@ impl<'a> Lower<'a> {
                 }
                 float(self, r)
             }
-            "v_cvt_f16_f32" if v.opsel == 0 => {
-                // Rounded to nearest even (the MODE default) into the low half.
-                let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("a 16-bit result outside a VGPR");
-                };
-                let r = self.low_half(inst, reg, r);
-                int(self, r)
-            }
             "v_pack_b32_f16" => {
                 // Two f16 sources (op_sel: their high halves; abs and neg on
                 // the sign bit) into the low and high half.
@@ -8153,13 +8140,6 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
                 let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
-            }
-            "v_cvt_f32_f16" if v.opsel == 0 => {
-                let a = s(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[a]);
-                float(self, r)
             }
             "v_cndmask_b32" => {
                 let cond = self.select_condition(inst, v.src.get(2))?;
@@ -9601,63 +9581,6 @@ impl<'a> Lower<'a> {
             "v_mul_hi_u32" | "v_mul_hi_i32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 self.mul_hi(a, b, name == "v_mul_hi_i32")
-            }
-            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" => {
-                // Each source saturated to 16 bits: src0 into the low half,
-                // src1 into the high one.
-                let unsigned = name == "v_cvt_pk_u16_u32";
-                let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let mut halves = [a, b];
-                for x in &mut halves {
-                    *x = if unsigned {
-                        let max = k(self, 0xFFFF);
-                        let over = self.s.m.cmp(c, pred::IUGT, *x, max);
-                        self.s.m.select(c, over, max, *x)
-                    } else {
-                        let (lo, hi, m) = (k(self, 0xFFFF_8000), k(self, 0x7FFF), k(self, 0xFFFF));
-                        let below = self.s.m.cmp(c, pred::SLT, *x, lo);
-                        let t = self.s.m.select(c, below, lo, *x);
-                        let above = self.s.m.cmp(c, pred::SGT, t, hi);
-                        let t = self.s.m.select(c, above, hi, t);
-                        self.s.m.bin(c, Bin::And, t, m)
-                    };
-                }
-                let k16 = k(self, 16);
-                let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
-                self.s.m.bin(c, Bin::Or, halves[0], hi)
-            }
-            "v_dot2_i32_i16" | "v_dot2_u32_u16" | "v_dot4_i32_i8" | "v_dot4_u32_u8"
-            | "v_dot8_u32_u4" => {
-                // The products of the packed fields of src0 and src1, summed
-                // into src2, wrapping (clamp is refused with the other
-                // integer output modifiers).
-                let Fields::Valu(v) = &inst.fields else {
-                    unreachable!()
-                };
-                if v.opsel != 0 || v.neg_hi != 0 {
-                    return Err("dot product operand selects");
-                }
-                let (bits, signed) = match name {
-                    "v_dot2_i32_i16" => (16, true),
-                    "v_dot2_u32_u16" => (16, false),
-                    "v_dot4_i32_i8" => (8, true),
-                    "v_dot4_u32_u8" => (8, false),
-                    _ => (4, false),
-                };
-                let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let mut sum = s(self, 2)?;
-                let op = if signed { Bin::AShr } else { Bin::LShr };
-                for i in 0..32 / bits {
-                    // Field i to the top, then down again (extending it).
-                    let (up, down) = (k(self, 32 - bits * (i + 1)), k(self, 32 - bits));
-                    let x = self.s.m.bin(c, Bin::Shl, a, up);
-                    let x = self.s.m.bin(c, op, x, down);
-                    let y = self.s.m.bin(c, Bin::Shl, b, up);
-                    let y = self.s.m.bin(c, op, y, down);
-                    let p = self.s.m.bin(c, Bin::Mul, x, y);
-                    sum = self.s.m.bin(c, Bin::Add, sum, p);
-                }
-                sum
             }
             "v_alignbit_b32" | "v_alignbyte_b32" => {
                 // The low dword of {a, b} >> shift.
@@ -12566,7 +12489,7 @@ impl<'a> Lower<'a> {
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
-                self.enter_loop(b, t, self.cur);
+                self.enter_loop(t, self.cur);
                 Term::Br(self.block[t].expect("reachable"))
             }
             LaneExit::Branch {
@@ -12608,7 +12531,6 @@ impl<'a> Lower<'a> {
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
-        let _ = Exit::End;
         self.s.m.terminate(self.cur, term);
         Ok(())
     }
@@ -12639,7 +12561,7 @@ impl<'a> Lower<'a> {
                 } else {
                     via
                 };
-                self.enter_loop(b, to, from);
+                self.enter_loop(to, from);
             }
         }
         Term::CondBr(cond, t, f)
@@ -12836,7 +12758,7 @@ impl<'a> Lower<'a> {
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
     /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
+    fn enter_loop(&mut self, to: usize, via: usize) {
         if let Some((_, incoming)) = self.counters.get_mut(&to) {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
