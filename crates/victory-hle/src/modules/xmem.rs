@@ -672,6 +672,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
+        victory_gpu::physical_will_write(slice.section.0 as usize, (slice.index * PAGE) as u64, n * PAGE);
         let Some(mut view) = View::map(slice, *n) else {
             return false;
         };
@@ -735,6 +736,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    victory_gpu::physical_will_write(slice.section.0 as usize, (slice.index * PAGE) as u64, n * PAGE);
     Some(PageWindow {
         view: View::map(slice, *n)?,
         within: offset % PAGE,

@@ -228,6 +228,20 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
     ))
 }
 
+/// Lazy copy-back owes the page shown at these addresses bytes the GPU
+/// wrote, which neither the write watch nor the guards will see: noted
+/// written for every copy, at a new asking, which is returned.
+pub(crate) fn noted_written(shown: &[usize]) -> u64 {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    for &at in shown {
+        j.written.insert(at / PAGE, now);
+        bump_region_epochs(at, at + PAGE);
+    }
+    now
+}
+
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
@@ -251,6 +265,10 @@ struct Guards {
     pins: VecDeque<(usize, usize, std::time::Instant)>,
     /// How many of `pins` hold each block.
     pinned: BTreeMap<usize, u32>,
+    /// Blocks lazy copy-back left without access ([`crate::lazy`]), by how
+    /// many of its pages hide each: the protections above are only noted
+    /// for them, and set when [`show`] gives them back.
+    owed: BTreeMap<usize, u32>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -260,6 +278,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     aliased: BTreeSet::new(),
     pins: VecDeque::new(),
     pinned: BTreeMap::new(),
+    owed: BTreeMap::new(),
 });
 
 /// How long blocks stay writable after [`writing`].
@@ -441,6 +460,82 @@ fn aliases(at: usize) -> Vec<usize> {
     views.as_ref().map_or(Vec::new(), |v| v.shown(at - at % BLOCK).to_vec())
 }
 
+/// The physical page shown at the block `at` is in: its section, its offset
+/// in it, and every address it is shown at. `None` outside the views we
+/// were told of, or for a page shown at more than [`MANY_VIEWS`].
+pub(crate) fn physical(at: usize) -> Option<(usize, u64, Vec<usize>)> {
+    let at = at - at % BLOCK;
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = views.as_ref()?;
+    let (&base, &(n, section, offset)) = views.by_addr.range(..=at).next_back()?;
+    if at >= base + n {
+        return None;
+    }
+    let shown = views.shown(at);
+    // Below the count up to which a new view puts the page back first.
+    if shown.is_empty() || shown.len() >= MANY_VIEWS {
+        return None;
+    }
+    Some((section, offset + (at - base) as u64, shown.to_vec()))
+}
+
+/// A view of our own of all of `section`, if the page at `at` is still its
+/// `offset`: mapped under the views' lock, so the runtime cannot unmap the
+/// title's view and close the section meanwhile.
+pub(crate) fn map_section(at: usize, section: usize, offset: u64) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    let at = at - at % BLOCK;
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let (&base, &(n, s, o)) = views.as_ref()?.by_addr.range(..=at).next_back()?;
+    if at >= base + n || s != section || o + (at - base) as u64 != offset {
+        return None;
+    }
+    // SAFETY: the section of a view the title has now; ours until unmapped.
+    let view = unsafe {
+        MapViewOfFile(section as windows_sys::Win32::Foundation::HANDLE, FILE_MAP_WRITE, 0, 0, 0)
+    };
+    (!view.Value.is_null()).then_some(view.Value as usize)
+}
+
+/// Before the runtime writes bytes `[offset, offset + len)` of the section
+/// `section` through a view of its own (xmem's `write_physical`,
+/// DirectStorage's page windows): pages lazy copy-back still owes there are
+/// put back first, or the GPU's bytes would later land over the new ones.
+pub fn physical_will_write(section: usize, offset: u64, len: usize) {
+    if len == 0 || !crate::lazy::owing() {
+        return;
+    }
+    let addresses: Vec<usize> = {
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(views) = views.as_ref() else { return };
+        let block = BLOCK as u64;
+        (offset / block..(offset + len as u64).div_ceil(block))
+            .filter_map(|k| views.pages.get(&(section, k)))
+            .flatten()
+            .copied()
+            .collect()
+    };
+    for at in addresses {
+        crate::lazy::resolve(at, BLOCK);
+    }
+}
+
+/// Before the kernel reads title memory `[at, at + len)` (it fails where
+/// lazy copy-back left a page without access): pinned like a kernel write,
+/// so nothing is hidden there while the kernel may still read it, then put
+/// back.
+pub fn kernel_will_read(at: usize, len: usize) {
+    if len == 0 || !crate::lazy::on() {
+        return;
+    }
+    {
+        let mut g = guards();
+        g.unpin_ended();
+        g.pin(at / BLOCK, (at + len).div_ceil(BLOCK), std::time::Instant::now() + PIN);
+    }
+    crate::lazy::resolve(at, len);
+}
+
 /// The runtime mapped a view at `[at, at + len)` of the bytes from `offset`
 /// on of the physical-page section `section`. The view is writable, so the
 /// same pages guarded at another view are opened: their copies check them
@@ -464,6 +559,11 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         }
     }
     if !others.is_empty() {
+        // The new view shows these pages without the protection lazy
+        // copy-back keeps on their other views.
+        for &a in &others {
+            crate::lazy::resolve(a, BLOCK);
+        }
         let mut g = guards();
         for a in others {
             open_here(&mut g, a, a + BLOCK);
@@ -476,10 +576,36 @@ pub fn title_memory_view_gone(at: usize, len: usize) {
     if let Some(views) = VIEWS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         views.forget(at, len);
     }
+    // Hidden since its remap: put back while the view still is (the
+    // runtime unmaps it after this), and no page of it is hidden again.
+    crate::lazy::resolve(at, len);
 }
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+/// The guards' lock, marked held for lazy copy-back's fault handler.
+struct GuardsHeld {
+    guard: std::sync::MutexGuard<'static, Guards>,
+    _inside: crate::lazy::Inside,
+}
+
+impl std::ops::Deref for GuardsHeld {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for GuardsHeld {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.guard
+    }
+}
+
+fn guards() -> GuardsHeld {
+    let inside = crate::lazy::Inside::enter();
+    GuardsHeld {
+        guard: GUARDS.lock().unwrap_or_else(|e| e.into_inner()),
+        _inside: inside,
+    }
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -654,11 +780,12 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
         g.clean.extend(from..to);
         written.extend(from * BLOCK / PAGE..to * BLOCK / PAGE);
     };
-    if set(from, to) {
+    if g.owed.range(from..to).next().is_none() && set(from, to) {
         note(g, written, from, to);
     } else {
         for block in from..to {
-            if set(block, block + 1) {
+            // A block lazy copy-back hides is only noted: `show` sets it.
+            if g.owed.contains_key(&block) || set(block, block + 1) {
                 note(g, written, block, block + 1);
             } else {
                 g.holes.insert(block);
@@ -688,8 +815,10 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
             g.aliased.insert(alias);
             if alias != block && !g.protected.contains(&alias) && !g.pinned(alias) {
                 let mut old = 0;
-                // SAFETY: title view memory; only its protection changes.
-                if unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+                if g.owed.contains_key(&alias)
+                    // SAFETY: title view memory; only its protection changes.
+                    || unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0
+                {
                     g.protected.insert(alias);
                 }
             }
@@ -732,6 +861,12 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    // Hidden by lazy copy-back: `show` gives them read-write access later.
+    let blocks: Vec<usize> = blocks.into_iter().filter(|b| !g.owed.contains_key(b)).collect();
+    if blocks.is_empty() {
+        bump_region_epochs(start, end);
+        return true;
     }
     // Runs of blocks next to each other in one call (fewer kernel
     // transitions and TLB shootdowns). One call cannot span two views: the
@@ -776,11 +911,16 @@ pub fn writing(at: usize, len: usize) {
         return;
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
-    let mut g = guards();
     let until = std::time::Instant::now() + PIN;
-    // The pins that ended are dropped here too, or they pile up until a first look at some range.
-    g.unpin_ended();
-    g.pin(first, last, until);
+    {
+        let mut g = guards();
+        // The pins that ended are dropped here too, or they pile up until a first look at some range.
+        g.unpin_ended();
+        g.pin(first, last, until);
+    }
+    // Pinned first, so lazy copy-back hides nothing there meanwhile.
+    crate::lazy::resolve(at, len);
+    let mut g = guards();
     open(&mut g, at, at + len);
     if !view_guard() {
         return;
@@ -816,6 +956,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         return;
     }
     let end = at.saturating_add(len);
+    // Before the old pages go: what lazy copy-back owes them lands in them.
+    crate::lazy::resolve(at, len);
     {
         let mut g = guards();
         let blocks: Vec<usize> = g
@@ -835,6 +977,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         for block in blocks {
             g.protected.remove(&block);
             g.clean.remove(&block);
+            if g.owed.contains_key(&block) {
+                continue;
+            }
             // A view mapped a moment ago may already have been made
             // read-only as another view of a guarded page (between the
             // runtime's `title_memory_view` and this call): it is given
@@ -908,6 +1053,9 @@ pub(crate) fn try_open_guarded(at: usize) -> bool {
     if writable(at) {
         return true;
     }
+    if g.owed.contains_key(&(at / BLOCK)) {
+        return false;
+    }
     // Read-only, in a view we were told of, and not noted guarded: only we
     // make title views read-only, so it is ours to give back.
     if view_guard() && !aliases(at).is_empty() {
@@ -931,6 +1079,124 @@ pub(crate) fn try_open_guarded(at: usize) -> bool {
     false
 }
 
+/// Lazy copy-back ([`crate::lazy`]): leaves each page's blocks (the
+/// addresses it is shown at) without access, all of a page's or none.
+/// Whether each page was: not where a kernel write is pinned, nor where a
+/// block is no view's.
+pub(crate) fn hide(pages: &[Vec<usize>]) -> Vec<bool> {
+    use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+    install();
+    let mut g = guards();
+    g.unpin_ended();
+    let mut ok: Vec<bool> = pages
+        .iter()
+        .map(|shown| shown.iter().all(|&at| !g.pinned(at / BLOCK)))
+        .collect();
+    let mut fresh = Vec::new();
+    for shown in pages.iter().zip(&ok).filter(|(_, ok)| **ok).map(|(s, _)| s) {
+        for &at in shown {
+            let n = g.owed.entry(at / BLOCK).or_insert(0);
+            *n += 1;
+            if *n == 1 {
+                fresh.push(at / BLOCK);
+            }
+        }
+    }
+    fresh.sort_unstable();
+    let mut failed = BTreeSet::new();
+    let mut i = 0;
+    while i < fresh.len() {
+        let mut j = i + 1;
+        while j < fresh.len() && fresh[j] == fresh[j - 1] + 1 {
+            j += 1;
+        }
+        // One call a run; a run over two views fails whole, so block by block then.
+        if !set_protection(fresh[i], fresh[j - 1] + 1, PAGE_NOACCESS) {
+            for &block in &fresh[i..j] {
+                if !set_protection(block, block + 1, PAGE_NOACCESS) {
+                    failed.insert(block);
+                }
+            }
+        }
+        i = j;
+    }
+    if failed.is_empty() {
+        return ok;
+    }
+    for (shown, ok) in pages.iter().zip(&mut ok) {
+        if !*ok || !shown.iter().any(|at| failed.contains(&(at / BLOCK))) {
+            continue;
+        }
+        *ok = false;
+        for &at in shown {
+            if unhide(&mut g, at / BLOCK)
+                && !failed.contains(&(at / BLOCK))
+                && !restore(&mut g, at / BLOCK, false)
+            {
+                tracing::warn!(at = format_args!("{at:#x}"), "a block lazy copy-back did not hide stayed without access");
+            }
+        }
+    }
+    ok
+}
+
+/// Gives back the blocks of a page [`hide`] hid (the addresses it is shown
+/// at), with the protection their guards keep: `written`, lazy copy-back
+/// put bytes into it, so every copy of it takes it again. Returns those
+/// that could not be given back, still counted hidden.
+pub(crate) fn show(shown: &[usize], written: bool) -> Vec<usize> {
+    let mut g = guards();
+    let mut stuck = Vec::new();
+    for &at in shown {
+        if unhide(&mut g, at / BLOCK) && !restore(&mut g, at / BLOCK, written) {
+            *g.owed.entry(at / BLOCK).or_insert(0) += 1;
+            stuck.push(at);
+        }
+    }
+    stuck
+}
+
+/// One hider less for `block`; whether it was the last.
+fn unhide(g: &mut Guards, block: usize) -> bool {
+    match g.owed.get_mut(&block) {
+        Some(n) if *n > 1 => {
+            *n -= 1;
+            false
+        }
+        Some(_) => {
+            g.owed.remove(&block);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The protection a block's guards keep, set on it again; whether it was.
+fn restore(g: &mut Guards, block: usize, written: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    if written {
+        g.protected.remove(&block);
+        g.clean.remove(&block);
+        g.aliased.remove(&block);
+        bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
+    }
+    let read_only = g.protected.contains(&block) && !g.pinned(block);
+    set_protection(block, block + 1, if read_only { PAGE_READONLY } else { PAGE_READWRITE })
+}
+
+fn set_protection(from: usize, to: usize, protection: u32) -> bool {
+    let mut old = 0;
+    // SAFETY: title view memory; only its protection changes.
+    unsafe {
+        windows_sys::Win32::System::Memory::VirtualProtect(
+            (from * BLOCK) as *const _,
+            (to - from) * BLOCK,
+            protection,
+            &mut old,
+        ) != 0
+    }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -943,13 +1209,16 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        let at = r.ExceptionInformation[1];
+        let (kind, at) = (r.ExceptionInformation[0], r.ExceptionInformation[1]);
+        if kind <= WRITE && crate::lazy::fault(at, kind == WRITE) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if kind != WRITE {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         if try_open_guarded(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
@@ -957,10 +1226,44 @@ fn install() {
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: the handler only touches our guard state and protections.
+    // SAFETY: the handler only touches our guard and lazy copy-back state,
+    // protections and our own views of title pages.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+#[cfg(test)]
+pub(crate) fn tests_writable(at: usize) -> bool {
+    writable(at)
+}
+
+#[cfg(test)]
+pub(crate) fn tests_readable(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery};
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
+}
+
+#[cfg(test)]
+pub(crate) fn tests_guard(start: usize, end: usize) {
+    let _ = guard(start, end);
+}
+
+/// Forgets the pins of `[at, at + len)`, so that a view another test maps
+/// there is not left writable by them.
+#[cfg(test)]
+pub(crate) fn tests_unpin(at: usize, len: usize) {
+    let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
+    let mut g = guards();
+    g.pins.retain(|&(from, to, _)| to <= first || from >= last);
+    let kept: Vec<_> = g.pins.drain(..).collect();
+    g.pinned.clear();
+    for (from, to, until) in kept {
+        g.pin(from, to, until);
+    }
 }
 
 /// Whether `at` is committed read-write memory now.

@@ -1796,6 +1796,7 @@ impl Host {
                 });
             }
         }
+        crate::lazy::finished(submission);
         for list in runs {
             for rb in &list.deferred().readbacks {
                 let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
@@ -3620,6 +3621,13 @@ fn ensure_safe_copy_veh() {
             const WRITE: usize = 1;
             if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
                 && r.NumberParameters >= 2
+                && r.ExceptionInformation[0] <= WRITE
+                && crate::lazy::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE)
+            {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                && r.NumberParameters >= 2
                 && r.ExceptionInformation[0] == WRITE
                 && crate::watch::try_open_guarded(r.ExceptionInformation[1])
             {
@@ -3730,6 +3738,12 @@ fn note_fault(from: usize, len: usize) {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    // The kernel's copy below fails on pages lazy copy-back hides.
+    crate::lazy::resolve(src as usize, len);
+    read_resolved(src, dst, len) || crate::lazy::resolve(src as usize, len) && read_resolved(src, dst, len)
+}
+
+fn read_resolved(src: *const u8, dst: *mut u8, len: usize) -> bool {
     #[cfg(target_arch = "x86_64")]
     if faulted_lately(src as usize, len) {
         USER_COPY_FAULTS[1].fetch_add(1, Ordering::Relaxed);
@@ -3757,6 +3771,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    crate::lazy::resolve(dst as usize, len);
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -4054,6 +4069,9 @@ impl Meter {
                 crate::descriptor::host::BACKLOG[1].load(Ordering::Relaxed),
                 making = crate::pipeline::making()
             );
+            if crate::lazy::on() {
+                tracing::info!("lazy copy-back since: {}", crate::lazy::text());
+            }
             #[cfg(feature = "diagnostics")]
             {
                 tracing::info!(

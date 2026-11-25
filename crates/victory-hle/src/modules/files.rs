@@ -539,6 +539,30 @@ pub extern "system" fn ReadFile(
     )
 }
 
+/// Kernel writes from title memory: the kernel reads the buffer, and fails
+/// on pages the GPU side's lazy copy-back left without access, so those are
+/// put back first.
+pub extern "system" fn WriteFile(
+    file: *mut c_void,
+    buffer: *const u8,
+    len: u32,
+    written: *mut u32,
+    overlapped: *mut c_void,
+) -> i32 {
+    victory_gpu::kernel_will_read(buffer as usize, len as usize);
+    host!("kernel32.dll", "WriteFile": extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32)(
+        file, buffer, len, written, overlapped,
+    )
+}
+
+/// The host CRT writes large requests straight from the caller's buffer.
+pub extern "C" fn fwrite(buffer: *const u8, size: usize, count: usize, stream: File) -> usize {
+    victory_gpu::kernel_will_read(buffer as usize, size.saturating_mul(count));
+    host!("ucrtbase.dll", "fwrite": extern "C" fn(*const u8, usize, usize, File) -> usize)(
+        buffer, size, count, stream,
+    )
+}
+
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
@@ -679,6 +703,8 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(ReadFile),
             hle_export!(fread),
+            hle_export!(WriteFile),
+            hle_export!(fwrite),
             hle_export!(CreateFileW),
             hle_export!(CreateFileA),
             hle_export!(CreateFile2),
