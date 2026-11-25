@@ -328,6 +328,19 @@ fn suspend(id: u32) -> bool {
     }
 }
 
+/// Lets thread `id`, stopped by [`suspend`], run on.
+fn resume(id: u32) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    // SAFETY: plain calls on a thread of ours.
+    unsafe {
+        if let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME, false, id) {
+            ResumeThread(thread);
+            let _ = CloseHandle(thread);
+        }
+    }
+}
+
 /// Notes pipelines the driver's compiler has worked on for long
 /// ([`ENDLESS`]): they are left out from now on. AMD's never ends
 /// some of the world's ray tracing programs, and takes memory all the while
@@ -343,11 +356,11 @@ fn endless(name: &str, begins: bool) {
     static WATCH: std::sync::Once = std::sync::Once::new();
     {
         let mut at_work = AT_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a plain call.
+        let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
         if begins {
-            // SAFETY: a plain call.
-            let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             at_work.push((name.to_owned(), Instant::now(), id));
-        } else if let Some(i) = at_work.iter().position(|w| w.0 == name) {
+        } else if let Some(i) = at_work.iter().position(|w| w.0 == name && w.2 == id) {
             at_work.swap_remove(i);
         }
     }
@@ -364,12 +377,12 @@ fn endless(name: &str, begins: bool) {
                     for id in lost {
                         super::make::worker_lost(id);
                     }
-                    let long: Vec<(String, u32)> = AT_WORK
+                    let long: Vec<(String, Instant, u32)> = AT_WORK
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .iter()
                         .filter(|w| w.1.elapsed() > ENDLESS && !noted.contains(&w.0))
-                        .map(|w| (w.0.clone(), w.2))
+                        .cloned()
                         .collect();
                     if long.is_empty() {
                         late = None;
@@ -377,7 +390,7 @@ fn endless(name: &str, begins: bool) {
                     }
                     let now = committed();
                     let grown = now.saturating_sub(*late.get_or_insert(now)) > GROWTH;
-                    let long: Vec<(String, u32)> = if grown {
+                    let long: Vec<(String, Instant, u32)> = if grown {
                         late = None;
                         long
                     } else {
@@ -386,22 +399,30 @@ fn endless(name: &str, begins: bool) {
                             .unwrap_or_else(|e| e.into_inner())
                             .iter()
                             .filter(|w| w.1.elapsed() > EVEN_SO && !noted.contains(&w.0))
-                            .map(|w| (w.0.clone(), w.2))
+                            .cloned()
                             .collect()
                     };
-                    for (name, id) in long {
+                    for (name, began, id) in long {
                         let stopped = suspend(id);
-                        // Caught, the thread may be on another compile by now.
-                        let name = if stopped {
-                            AT_WORK
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .iter()
-                                .find(|w| w.2 == id)
-                                .map_or(name, |w| w.0.clone())
+                        let same = |w: &(String, Instant, u32)| w.2 == id && w.1 == began && w.0 == name;
+                        // Only that compile is acted on (the thread may have ended it meanwhile); a thread
+                        // caught after the driver returned but before `Making` drops counts as endless.
+                        let still = if stopped {
+                            // Not waited for: the stopped thread may hold it.
+                            match AT_WORK.try_lock() {
+                                Ok(at_work) => at_work.iter().any(same),
+                                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().iter().any(same),
+                                Err(std::sync::TryLockError::WouldBlock) => false,
+                            }
                         } else {
-                            name
+                            AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).iter().any(same)
                         };
+                        if !still {
+                            if stopped {
+                                resume(id);
+                            }
+                            continue;
+                        }
                         // Noted before its waiters wake, or one compiles it again.
                         note_crashed(&name);
                         if stopped {
