@@ -1049,16 +1049,23 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // The journal is the process's and keeps pages after their memory
+        // is freed: an earlier test's allocation at this address left its
+        // writes there, older than any asking from now on (callers compare
+        // with their own last asking). Only those since `first` are ours.
+        let (first, before) = writes(start, end, false).expect("watched");
+        assert!(before.iter().all(|&(_, w)| w < first));
+        let since = |found: Vec<(usize, u64)>| -> Vec<(usize, u64)> {
+            found.into_iter().filter(|&(_, w)| w >= first).collect()
+        };
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        assert_eq!(since(after), [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
-        assert_eq!(again, [(p / PAGE + 1, now)]);
+        assert_eq!(since(again), [(p / PAGE + 1, now)]);
         // The same answer without the list: newer than the asking before it, not than it.
         let (_, newer) = written_since(start, end, false, now - 1).expect("watched");
         assert!(newer);
