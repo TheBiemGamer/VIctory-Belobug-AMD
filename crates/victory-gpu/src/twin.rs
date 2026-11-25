@@ -1,6 +1,6 @@
 //! Depth textures that shaders also write as unordered-access images.
 //!
-//! The console lets a depth texture be both: Grand Theft Auto VI's material
+//! The console lets a depth texture be both: the title's material
 //! classifier (`CS_GenerateMaterialMasks`, `CS_MaterialTilesInitial`) writes
 //! each pixel's material number (n / 65535) into the depth plane of a
 //! 16-bit depth + stencil texture and flag bits into its stencil plane; the

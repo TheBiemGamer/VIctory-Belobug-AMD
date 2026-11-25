@@ -2592,8 +2592,8 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
     loose(address, address.checked_add(reach)?)
 }
 
-/// Titles also use memory outside any buffer object as GPU memory (Grand
-/// Theft Auto VI's interface vertices, from its own allocator). Such memory
+/// Titles also use memory outside any buffer object as GPU memory (the
+/// title's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
 /// shortcut: copies of windows are never freed; key them to the title's
 /// allocations if memory use grows.

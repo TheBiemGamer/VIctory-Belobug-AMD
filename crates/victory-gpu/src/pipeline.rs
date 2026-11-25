@@ -4,7 +4,7 @@
 //! types.
 //!
 //! Host pipelines are made on a pipeline's first draw, not at creation:
-//! Grand Theft Auto VI creates some 60,000 pipelines in its first 20
+//! The title creates some 60,000 pipelines in its first 20
 //! seconds and draws with a few dozen (decision 0007, step 3). Shader
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
@@ -539,8 +539,8 @@ pub(crate) extern "system" fn create_compute(
         return E_INVALIDARG;
     };
     let shader = copy("compute", &desc.stage);
-    // A container of another compiler's code only (`ACCC`: Grand Theft Auto
-    // VI's upscaler passes) does not run here: the title is told, and does
+    // A container of another compiler's code only (`ACCC`: the
+    // title's upscaler passes) does not run here: the title is told, and does
     // without (`VICTORY_ACCC=1` takes them, their dispatches are dropped).
     #[cfg(windows)]
     if let Some(s) = &shader
@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
-    /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
+    /// The stream layout the title builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample
     /// mask, rasterizer, depth-stencil 1, sample description, input layout,
     /// topology, render target and depth formats: 0x2b0 bytes.

@@ -1,6 +1,6 @@
 //! Memory for host textures only read by shaders: slots in shared heaps.
 //! A texture of its own in a committed resource is a driver allocation of
-//! 64 KiB at least, made and freed through the kernel; Grand Theft Auto VI
+//! 64 KiB at least, made and freed through the kernel; the title
 //! streams in tens of thousands, many of some bytes.
 
 use std::collections::BTreeMap;

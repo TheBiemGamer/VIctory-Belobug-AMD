@@ -493,8 +493,8 @@ pub fn container_programs(c: &crate::Container) -> Result<Vec<NativeProgram>, Sh
     }
 }
 
-/// The compute program of an `ACCC` part (AMD's ACO compiler: Grand Theft
-/// Auto VI's upscaler passes), as observed:
+/// The compute program of an `ACCC` part (AMD's ACO compiler: the
+/// title's upscaler passes), as observed:
 ///
 /// ```text
 /// +0x00 "FSPX"  u32 version (1), u32 chunk count, u32 size, then per chunk:

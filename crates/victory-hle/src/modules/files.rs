@@ -83,7 +83,7 @@ pub fn mount_at(letter: char, root: &Path) {
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
 /// keeps its own). An empty root is the current directory, as it is to a
 /// path joined to it: it is the title's folder when the title is run by its
-/// file name alone (`victory run GTA6.exe`).
+/// file name alone (`victory run Game.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
     let root = if root.as_os_str().is_empty() {
         Path::new(".")
@@ -515,7 +515,7 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 
 // Kernel reads into title memory. The GPU side leaves blocks of title GPU
 // buffers read-only to see the title's next write, and the kernel's writes
-// fail there instead of faulting into its handler; Grand Theft Auto VI's
+// fail there instead of faulting into its handler; the title's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
 // is opened first.

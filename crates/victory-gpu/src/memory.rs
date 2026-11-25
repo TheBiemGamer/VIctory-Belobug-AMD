@@ -1,5 +1,5 @@
-//! Title memory by address, for shaders that follow pointers: Grand Theft
-//! Auto VI's rays walk an acceleration structure the title builds itself,
+//! Title memory by address, for shaders that follow pointers: the
+//! title's rays walk an acceleration structure the title builds itself,
 //! with 40-bit pointers from constants and from memory.
 //!
 //! Every host view heap ends with some slots of ours: a map, then raw views
