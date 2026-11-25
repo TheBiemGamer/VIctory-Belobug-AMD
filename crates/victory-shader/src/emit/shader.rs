@@ -23,6 +23,8 @@ pub(crate) mod flags {
     pub const DOUBLE_EXT: u64 = 1 << 6;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs in a vertex, geometry or mesh program.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -708,6 +710,12 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        // Root UAVs outside pixel and compute programs, as DXC counts them:
+        // declared ranges, not UAVs indexed from the heap.
+        let compute = self.threads.is_some() && self.mesh.is_none() && !self.rectangles;
+        if !self.root_uavs.is_empty() && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -805,6 +813,9 @@ impl Shader {
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
@@ -908,5 +919,62 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::*;
+
+    /// A program that sets a bit through a root UAV, or (`heap`) a UAV
+    /// indexed from the heap: a vertex (`pixel` false, no thread-group
+    /// size), pixel or compute program.
+    fn marked(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Vec<u8> {
+        let mut s = Shader::new(pixel);
+        s.threads = threads;
+        let b = s.entry;
+        let h = if heap {
+            let index = s.m.i32(0);
+            s.heap_handle(b, index, false, false, (11 | 0x1000, 0))
+        } else {
+            s.root_uav_handle(0, false)
+        };
+        let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
+        let iu = s.m.undef(s.t.i32);
+        let i32t = s.t.i32;
+        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
+        s.m.terminate(b, Term::Ret);
+        s.finish()
+    }
+
+    /// A vertex program writing a root UAV declares UAVs at every stage
+    /// (upstream's validator run refused 5,046 programs without it: "Flags
+    /// must match usage"); pixel and compute programs do not, nor a vertex
+    /// program whose UAVs all come from the heap (the validator counts
+    /// declared ranges only).
+    #[test]
+    fn uavs_outside_pixel_and_compute_programs_are_declared() {
+        #[cfg(windows)]
+        let mut validator = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for (name, pixel, threads, heap, every) in [
+            ("vertex", false, None, false, true),
+            ("pixel", true, None, false, false),
+            ("compute", false, Some([1, 1, 1]), false, false),
+            ("vertex, heap", false, None, true, false),
+        ] {
+            let dxil = marked(pixel, threads, heap);
+            let sfi0 = crate::Container::parse(&dxil).unwrap();
+            let sfi0 = sfi0.part(crate::FourCC::SFI0).unwrap().data;
+            let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+            assert_eq!(features & 0x4 != 0, every, "{name}");
+            #[cfg(windows)]
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut dxil.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
     }
 }
