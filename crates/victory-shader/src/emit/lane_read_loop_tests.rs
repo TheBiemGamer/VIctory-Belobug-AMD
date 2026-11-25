@@ -10,8 +10,8 @@
 //! not there for the later iterations' lane reads (`WaveReadLaneAt` of an
 //! inactive lane), and lane 0, which skips the loop, never saw the s9 the
 //! loop set (12 of 32 and 24 of 64 lanes wrong, #225). Such programs now
-//! run in the console flow (`lower::CONSOLE_FLOW`) on every host. Run on
-//! every hardware adapter; each wrong lane is listed.
+//! run in the console flow (`lower::CONSOLE_FLOW`) on hosts offering the
+//! required wave width. Check every hardware adapter and list each wrong lane.
 
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 
 use super::host::{Dispatch, Host, Root, View};
+use super::tests::{emit_for, lane_fixture_can_run};
 use crate::native::{ComputeIo, RootParam, RootType, StageIo};
 
 /// The program for waves of `wave` lanes, one wave per group, reading
@@ -116,28 +117,24 @@ fn devices() -> Vec<(String, Host)> {
     out
 }
 
-fn emit(native: &crate::NativeProgram, target: super::Target) -> super::HostShader {
-    let c = crate::Container {
-        digest: [0; 16],
-        version: (1, 0),
-        parts: vec![],
-    };
-    let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-    let io = crate::io::raise(&p, native).unwrap();
-    let st = crate::structure::structure(&p).unwrap();
-    super::emit(&c, native, &p, &st, &io, &res, target).unwrap()
-}
-
 #[test]
 fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
     let mut wrong = Vec::new();
-    let mut ran = 0;
+    let mut checked = 0;
+    let wave16 = super::Target {
+        lanes_min: 16,
+        lanes_max: 16,
+    };
     for (wave, lane) in [(32, 20), (64, 40)] {
+        let p = program(wave, lane);
+        assert!(!lane_fixture_can_run(&p, wave16, "wave16"));
         for (name, host) in devices() {
-            // For the host's waves: a wave64 program runs in two halves
-            // where there are no 64-lane waves.
-            let cs = emit(&program(wave, lane), host.target());
+            let target = host.target();
+            checked += 1;
+            if !lane_fixture_can_run(&p, target, &name) {
+                continue;
+            }
+            let cs = emit_for(&p, target).unwrap_or_else(|e| panic!("{name}: wave{wave}: {e}"));
             let (root, pso) = host
                 .compute_pipeline(&cs)
                 .unwrap_or_else(|e| panic!("{name}: wave{wave}: {e}"));
@@ -156,7 +153,6 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
                 )
                 .unwrap()
                 .remove(0);
-            ran += 1;
             let bad: Vec<String> = (0..wave)
                 .filter(|&t| out[t as usize] != t + lane)
                 .map(|t| format!("{t}: {} (want {})", out[t as usize], t + lane))
@@ -173,6 +169,6 @@ fn lane_reads_in_a_loop_lanes_leave_at_different_iterations() {
             }
         }
     }
-    assert!(ran > 0, "no adapter ran the program");
+    assert!(checked > 0, "no hardware adapter was tested");
     assert!(wrong.is_empty(), "wrong on {wrong:?}");
 }
