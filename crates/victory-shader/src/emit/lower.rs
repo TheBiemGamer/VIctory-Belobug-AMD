@@ -1908,14 +1908,16 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF | Op::AddF16, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                // Signedness 0 for floats, as DXC emits; a wrong one removed
+                // the device in the pipeline compile on RDNA4 (xcl dc2d8f1).
+                let (k0, sign) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
                     Attr::NoUnwind,
                     ty,
                     121,
-                    &[arg, k0, k1],
+                    &[arg, k0, sign],
                 );
                 if inclusive {
                     self.s.m.bin(c, Bin::Add, r, arg)
