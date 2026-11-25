@@ -1186,7 +1186,11 @@ impl Lower<'_> {
                 Ok(self.s.m.int_const(i64t, f.to_bits() as i64))
             }
             Operand::Literal(x) if float => Ok(self.s.m.int_const(i64t, i64::from(x) << 32)),
-            Operand::Literal(x) if inst.name() == "v_mad_i64_i32" => {
+            // A signed 64-bit operand sign-extends its 32-bit literal, as the
+            // hardware does (LLVM's AMDGPU operand rules).
+            Operand::Literal(x)
+                if inst.name() == "v_mad_i64_i32" || inst.name().ends_with("_i64") =>
+            {
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             Operand::Const(k @ 128..=208) => {
@@ -1194,7 +1198,8 @@ impl Lower<'_> {
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             _ => {
-                // Literals and the null register: zero-extended.
+                // Literals (of unsigned and bit operands) and the null
+                // register: zero-extended.
                 let x = self.operand(inst, &op)?;
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
