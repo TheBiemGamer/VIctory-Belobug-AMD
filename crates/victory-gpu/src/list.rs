@@ -333,11 +333,11 @@ pub(crate) extern "system" fn create_list(
     _nodes: u32,
     kind: u32,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    new_list(kind, allocator, iid, out)
+    new_list(kind, allocator, pipeline, iid, out)
 }
 
 /// The console's list creation: type, flags, node mask and barrier batch
@@ -355,7 +355,7 @@ pub(crate) extern "system" fn create_list_x(
     _: This,
     desc: *const ListDesc,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -364,10 +364,18 @@ pub(crate) extern "system" fn create_list_x(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "console command list");
-    new_list(desc.kind, allocator, iid, out)
+    new_list(desc.kind, allocator, pipeline, iid, out)
 }
 
-fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRESULT {
+/// A list as created, set to draw with `pipeline` (null: none yet), as a
+/// reset with it would.
+fn new_list(
+    kind: u32,
+    allocator: This,
+    pipeline: This,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -400,9 +408,17 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         #[cfg(windows)]
         parts: Default::default(),
         #[cfg(windows)]
-        state: Default::default(),
+        state: {
+            let mut state = crate::draw::State::default();
+            state.set_pipeline(pipeline);
+            std::sync::Mutex::new(state)
+        },
     });
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    if hr == S_OK {
+        crate::pipeline::bound(pipeline);
+    }
+    hr
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -2086,7 +2102,7 @@ mod tests {
         let null = std::ptr::null();
         let (mut allocator, mut list) = (null, null);
         assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
-        assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
+        assert_eq!(new_list(0, allocator, null, &LIST_IIDS[0], &mut list), S_OK);
         let memory = [0u64; 2];
         let at = |i: usize| (&raw const memory[i]) as u64;
         let value = |i: usize| {
