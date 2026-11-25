@@ -100,7 +100,7 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
-    host_heaps: [usize; 2],
+    host_heaps: Option<[usize; 2]>,
     /// Tables made afresh in this list, by a hash of the table and what it
     /// holds ([`table_hash`]).
     fresh_tables: std::collections::HashMap<u64, Fresh, std::hash::BuildHasherDefault<Plain>>,
@@ -197,6 +197,18 @@ fn dropped(pipeline: usize) {
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
+}
+
+/// A heap of ours of views (`samplers` false) or samplers, made on first use,
+/// for lists the title binds no heap of that kind for. Its slots are null
+/// views or point samplers; the view heap also has the views of memory by
+/// address.
+fn our_heap(samplers: bool) -> Option<&'static crate::descriptor::host::HostHeap> {
+    static OURS: [std::sync::OnceLock<Option<crate::descriptor::host::HostHeap>>; 2] =
+        [const { std::sync::OnceLock::new() }; 2];
+    OURS[usize::from(samplers)]
+        .get_or_init(|| crate::descriptor::host::HostHeap::new(samplers, 16))
+        .as_ref()
 }
 
 /// Dispatches run on the host so far.
@@ -470,7 +482,7 @@ impl State {
     pub(crate) fn continue_in(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
-        self.host_heaps = [0; 2];
+        self.host_heaps = None;
         // Making one refreshes what it names, which is each list's own work.
         self.fresh_tables.clear();
         self.fresh_records.clear();
@@ -625,21 +637,10 @@ impl State {
                 _ => {}
             }
         }
-        if self.heaps[0] != 0 {
-            return Some(crate::descriptor::heap(self.heaps[0] as This).host()?.memory());
-        }
-        static OURS: std::sync::OnceLock<Option<crate::descriptor::host::HostHeap>> =
-            std::sync::OnceLock::new();
-        let heap = OURS
-            .get_or_init(|| crate::descriptor::host::HostHeap::new(false, 16))
-            .as_ref()?;
-        const OURS_BOUND: [usize; 2] = [usize::MAX, 0];
-        if self.host_heaps != OURS_BOUND {
-            // SAFETY: an open list and a shader-visible heap.
-            unsafe { list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]) };
-            self.host_heaps = OURS_BOUND;
-            self.host_roots = [0; 2];
-        }
+        let heap = match self.heaps[0] {
+            0 => our_heap(false)?,
+            h => crate::descriptor::heap(h as This).host().or_else(|| our_heap(false))?,
+        };
         Some(heap.memory())
     }
 
@@ -813,24 +814,28 @@ impl State {
                 .iter()
                 .any(|u| u.root == RootType::MEMORY)
         });
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
         let memory = by_address.then(|| self.memory(list, compute)).flatten();
         if by_address && memory.is_none() {
             return no("no view of memory");
         }
-        if self.host_heaps != self.heaps && !(by_address && self.heaps[0] == 0) {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+        // None until heaps are bound: a title that binds none still gets ours.
+        if self.host_heaps != Some(self.heaps) {
+            // One of each kind, ours where the title binds none: every root
+            // signature indexes both directly, which needs both bound (id 1419).
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = [false, true]
+                .into_iter()
+                .zip(self.heaps)
+                .filter_map(|(samplers, h)| match h {
+                    0 => our_heap(samplers),
+                    // A title heap with no host one (not shader-visible) is bound as none.
+                    h => crate::descriptor::heap(h as This).host().or_else(|| our_heap(samplers)),
+                })
                 .map(|h| Some(h.heap.clone()))
                 .collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = Some(self.heaps);
             self.host_roots = [0; 2];
         }
         let root = p.root.as_raw() as usize;
