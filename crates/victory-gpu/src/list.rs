@@ -125,8 +125,10 @@ struct List {
     /// that work runs first.
     #[cfg(windows)]
     parts: std::cell::UnsafeCell<Vec<Arc<crate::host::HostList>>>,
+    /// Draw state is used by the title's calls on one thread at a time, like
+    /// `host` and `parts`; recording does not need a lock per command.
     #[cfg(windows)]
-    state: std::sync::Mutex<crate::draw::State>,
+    state: std::cell::UnsafeCell<crate::draw::State>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -136,9 +138,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
-    // SAFETY: the title passes one of our lists.
-    let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    // SAFETY: the title passes one of our lists and calls it on one thread at
+    // a time, so no other call is borrowing this state.
+    let state = unsafe { &mut *(*this.cast::<List>()).state.get() };
+    f(list, state);
 }
 
 /// The host list behind a title list, if there is a host GPU.
@@ -203,9 +206,12 @@ fn cut(this: This) {
     // and no reference to the host list is in use here.
     let (host, parts, state) = unsafe {
         let list = &*this.cast::<List>();
-        (&mut *list.host.get(), &mut *list.parts.get(), &list.state)
+        (
+            &mut *list.host.get(),
+            &mut *list.parts.get(),
+            &mut *list.state.get(),
+        )
     };
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
     state.end_hoist();
     if let Some(old) = host.replace(next) {
         old.close();
@@ -230,9 +236,12 @@ fn hoist(this: This) {
     // and no reference to the host list is in use here.
     let (host, parts, state) = unsafe {
         let list = &*this.cast::<List>();
-        (&mut *list.host.get(), &mut *list.parts.get(), &list.state)
+        (
+            &mut *list.host.get(),
+            &mut *list.parts.get(),
+            &mut *list.state.get(),
+        )
     };
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
     let Some(current) = host.as_ref() else { return };
     if state.hoists_into(current) {
         return;
@@ -411,7 +420,7 @@ fn new_list(
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
-            std::sync::Mutex::new(state)
+            std::cell::UnsafeCell::new(state)
         },
     });
     let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
@@ -446,9 +455,10 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
-        // SAFETY: the title passes one of our lists.
-        let state = unsafe { &(*this.cast::<List>()).state };
-        state.lock().unwrap_or_else(|e| e.into_inner()).end_hoist();
+        // SAFETY: the title passes one of our lists and calls it on one thread
+        // at a time, so no other call is borrowing this state.
+        let state = unsafe { &mut *(*this.cast::<List>()).state.get() };
+        state.end_hoist();
         host.close();
     }
     S_OK
@@ -465,9 +475,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // SAFETY: as above; the title uses a list on one thread at a time.
         let (host, state) = unsafe {
             let list = &*this.cast::<List>();
-            (&mut *list.host.get(), &list.state)
+            (&mut *list.host.get(), &mut *list.state.get())
         };
-        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         state.end_hoist();
         // SAFETY: as above.
         let parts = unsafe { &mut *(*this.cast::<List>()).parts.get() };
@@ -2289,4 +2298,46 @@ mod tests {
             list.list.Close().expect("command list must close cleanly");
         }
     }
+    /// CPU-only timing for the lock taken by every recorded draw-state call.
+    /// Run with:
+    /// `cargo test --release -p victory-gpu --lib benchmark_state_lock -- --ignored --nocapture --test-threads=1`
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn benchmark_state_lock() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        const CALLS: usize = 200_000;
+        let mut samples = Vec::new();
+        for sample in 0..5 {
+            let started = std::time::Instant::now();
+            for i in 0..CALLS {
+                state::stencil_ref(list, (i & 0xff) as u32);
+            }
+            let ns = started.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
+            println!("sample {sample}: {ns:.1} ns/call");
+            samples.push(ns);
+        }
+        samples.sort_by(f64::total_cmp);
+        println!("median: {:.1} ns/call", samples[samples.len() / 2]);
+
+        assert_eq!(close(list), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
 }
