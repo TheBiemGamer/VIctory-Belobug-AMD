@@ -78,6 +78,10 @@ a lower bound.
   a translator change won.
 - Per-command GPU time: `VICTORY_GPU_TIMING=1` runs and times each list on
   its own. It is slower, so it does not go with a frame-rate comparison.
+- Faulting reads: in a diagnostics build, the line "reads of title memory
+  since" counts the user-mode copies of title memory that faulted (each
+  costs an exception) and the reads sent straight to the kernel
+  because their 64 KiB block faulted in the last two seconds.
 - Device loss: `VICTORY_D3D12_DRED=1` names the allocation hit.
   `VICTORY_KEEP_RETIRED=1` frees nothing retired. If DRED still says
   "inside freed" with it set, the access was a wild one, not a late use of a

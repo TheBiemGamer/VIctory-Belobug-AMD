@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -3253,7 +3253,7 @@ unsafe extern "C" {
 #[cfg(target_arch = "x86_64")]
 fn ensure_safe_copy_veh() {
     use windows_sys::Win32::Foundation::{
-        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -3262,8 +3262,10 @@ fn ensure_safe_copy_veh() {
     unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: Windows passes valid exception and context pointers.
         let r = unsafe { &*(*info).ExceptionRecord };
+        // A guard page in title memory (xmem keeps PAGE_GUARD) would otherwise crash the process.
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && r.ExceptionCode != EXCEPTION_IN_PAGE_ERROR as NTSTATUS
+            && r.ExceptionCode != EXCEPTION_GUARD_PAGE as NTSTATUS
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -3334,12 +3336,72 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// Reads of title memory since the last log line: the user-mode copies that
+/// faulted (each costs an exception, tens of microseconds), and those sent
+/// straight to the kernel because their 64 KiB block faulted lately.
+pub(crate) static USER_COPY_FAULTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The 64 KiB blocks of title memory a user-mode read faulted in lately, by
+/// block number in the place its low bits name; forgotten every two seconds
+/// (after fxceless 0b0074e).
+static FAULTED: [AtomicUsize; 1024] = [const { AtomicUsize::new(0) }; 1024];
+/// When [`FAULTED`] was last emptied, in milliseconds since the first read.
+static FAULTED_EMPTIED: AtomicU64 = AtomicU64::new(0);
+
+/// The first and last 64 KiB block numbers of `[from, from + len)`, never 0
+/// (an empty place).
+fn fault_blocks(from: usize, len: usize) -> (usize, usize) {
+    ((from >> 16) | 1 << 63, (from.wrapping_add(len.max(1) - 1) >> 16) | 1 << 63)
+}
+
+fn faulted_lately(from: usize, len: usize) -> bool {
+    let (first, last) = fault_blocks(from, len);
+    if FAULTED[first & 1023].load(Ordering::Relaxed) != first
+        && FAULTED[last & 1023].load(Ordering::Relaxed) != last
+    {
+        return false;
+    }
+    // The clock only on a hit: a kernel call follows anyway, and hot reads stay two loads.
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let emptied = FAULTED_EMPTIED.load(Ordering::Relaxed);
+    if now.saturating_sub(emptied) >= 2_000 {
+        if FAULTED_EMPTIED
+            .compare_exchange(emptied, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            for place in &FAULTED {
+                place.store(0, Ordering::Relaxed);
+            }
+        }
+        return false;
+    }
+    true
+}
+
+fn note_fault(from: usize, len: usize) {
+    let (first, last) = fault_blocks(from, len);
+    FAULTED[first & 1023].store(first, Ordering::Relaxed);
+    FAULTED[last & 1023].store(last, Ordering::Relaxed);
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     #[cfg(target_arch = "x86_64")]
-    if let Some(ok) = try_user_copy(dst, src, len) {
-        return ok;
+    if faulted_lately(src as usize, len) {
+        USER_COPY_FAULTS[1].fetch_add(1, Ordering::Relaxed);
+    } else if let Some(ok) = try_user_copy(dst, src, len) {
+        if ok {
+            return true;
+        }
+        // Refused without a fault (a low or wrapping range): unreadable, as before.
+        if (src as usize) < 0x10000 || (src as usize).checked_add(len).is_none() {
+            return false;
+        }
+        // The page may have been mapped since; the kernel reports a hole without an exception.
+        USER_COPY_FAULTS[0].fetch_add(1, Ordering::Relaxed);
+        note_fault(src as usize, len);
     }
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -3610,6 +3672,11 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                tracing::info!(
+                    faults = USER_COPY_FAULTS[0].swap(0, Ordering::Relaxed),
+                    skipped = USER_COPY_FAULTS[1].swap(0, Ordering::Relaxed),
+                    "reads of title memory since: user-mode copies that faulted, and sent to the kernel as their block faulted lately"
+                );
                 tracing::info!(
                     written = crate::resource::rewrites(),
                     evicted = crate::resource::EVICTED.load(Ordering::Relaxed),
