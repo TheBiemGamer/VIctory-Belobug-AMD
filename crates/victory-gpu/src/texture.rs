@@ -429,12 +429,16 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        // The footprints' offsets count from the shared buffer's start (a slab
+        // slot's offset added): the texture's bytes end `size` past the first.
+        let end = self.footprints.first().map_or(0, |f| f.Offset) + self.size;
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips + self.skip, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, end);
+            // SAFETY: the subresource's part of the mapped staging buffer: the
+            // last row is not padded to the pitch, so `len` stops at its end.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -447,6 +451,16 @@ impl Staging {
             }
         }
     }
+}
+
+/// Bytes of the staging memory, which ends at `end`, a subresource at
+/// `offset` may take: `GetCopyableFootprints` does not pad the last row of
+/// the last one, so `pitch * rows * depth` can run past it (into the next
+/// texture's slot of a shared slab).
+fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, end: u64) -> usize {
+    let padded = pitch.saturating_mul(rows as usize).saturating_mul(depth as usize);
+    let left = usize::try_from(end.saturating_sub(offset)).unwrap_or(usize::MAX);
+    padded.min(left)
 }
 
 /// Diagnostics: which textures' contents change, how often, and whether they
@@ -1136,5 +1150,15 @@ mod read_tests {
         });
         // SAFETY: this reservation is no longer used.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn subresource_len_stays_inside_staging_total() {
+        // 4x4 RGBA8: pitch 256, 4 rows, the last 16 bytes: 784 in all.
+        assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
+        assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
+        assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+        // In a slab slot at 64 KiB: offsets and the end both count from the slab.
+        assert_eq!(subresource_len(65536, 256, 4, 1, 65536 + 784), 784);
     }
 }
