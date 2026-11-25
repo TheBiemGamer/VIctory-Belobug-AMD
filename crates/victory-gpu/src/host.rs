@@ -152,6 +152,11 @@ static RETIRED: Mutex<std::collections::VecDeque<Retired>> =
 /// Submissions started.
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The submissions started so far; the last one's number.
+pub(crate) fn started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
 /// Presented host frames a retired object is also kept for. Worker threads
 /// record lists ahead of submission and a title frame spans many
 /// submissions, so finishing the submissions running when it was retired
@@ -1228,7 +1233,7 @@ impl Host {
             if let Some(Finish { lists, back }) = done.finish.take() {
                 {
                     let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
-                    self.finish_submission(&runs, back);
+                    self.finish_submission(&runs, back, done.submission);
                 }
                 // Before its lists go: a list that goes with it waits for
                 // this fence, with `submitted` held here.
@@ -1237,6 +1242,7 @@ impl Host {
             } else {
                 FINISHED_FENCE.fetch_max(done.fence, Ordering::AcqRel);
             }
+            crate::remap::finished(done.submission);
         }
         if last_sub != 0 {
             bury(last_sub);
@@ -1605,7 +1611,7 @@ impl Host {
             if card_after_ran {
                 if let Some(engine_lock) = self.card_engine() {
                     let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let written = engine.finish_back(self, plan, &mut submitted);
+                    let written = engine.finish_back(self, plan, &mut submitted, this_submission);
                     COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                 } else {
                     plan.clear_pending();
@@ -1615,7 +1621,8 @@ impl Host {
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
-        self.finish_submission(runs, cpu_back);
+        self.finish_submission(runs, cpu_back, this_submission);
+        crate::remap::finished(this_submission);
         self.log_messages();
     }
 
@@ -1626,11 +1633,12 @@ impl Host {
         &self,
         runs: &[&HostList],
         back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        submission: u64,
     ) {
         let copying = std::time::Instant::now();
         if back.len() <= 1 {
             for (shadow, address, len) in &back {
-                let written = shadow.copy_back(*address, *len);
+                let written = shadow.copy_back(*address, *len, submission);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             }
         } else {
@@ -1650,14 +1658,14 @@ impl Host {
             }
             if groups.len() <= 1 {
                 for (shadow, address, len) in &groups[0] {
-                    let written = shadow.copy_back(*address, *len);
+                    let written = shadow.copy_back(*address, *len, submission);
                     COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                 }
             } else {
                 in_parallel(&groups, 8, |chunk| {
                     for g in chunk {
                         for (shadow, address, len) in g {
-                            let written = shadow.copy_back(*address, *len);
+                            let written = shadow.copy_back(*address, *len, submission);
                             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                         }
                     }

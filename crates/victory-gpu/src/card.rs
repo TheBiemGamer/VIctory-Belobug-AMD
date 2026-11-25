@@ -810,11 +810,13 @@ impl CardEngine {
     /// Reads the `differs` results after the submission fence completes, fetches
     /// ONLY the 64 KiB pages the GPU actually modified, and merges them into
     /// title memory + `staging`. Returns total bytes written to title memory.
+    /// `submission` is the one whose shaders wrote them.
     pub(crate) fn finish_back(
         &mut self,
         host: &Host,
         plan: CardPlan,
         submitted: &mut u64,
+        submission: u64,
     ) -> usize {
         if plan.entries.is_empty() {
             return 0;
@@ -923,7 +925,9 @@ impl CardEngine {
                     crate::host::in_parallel(&per_entry, 4, |chunk| {
                         for (entry_idx, runs) in chunk {
                             let entry = &plan.entries[*entry_idx];
-                            let n = entry.shadow.merge_card_pieces(&entry.card, runs);
+                            let n = entry
+                                .shadow
+                                .merge_card_pieces(&entry.card, runs, submission);
                             total_written.fetch_add(n as u64, Ordering::Relaxed);
                         }
                     });
@@ -1037,7 +1041,7 @@ mod tests {
             std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec()
         };
         assert_eq!(differs_1, vec![0, 0, 0, 0]);
-        let written_1 = engine.finish_back(&host, plan, &mut submitted);
+        let written_1 = engine.finish_back(&host, plan, &mut submitted, u64::MAX);
         assert_eq!(written_1, 0);
 
         // Phase 2: GPU writes 4 bytes on page 2 while CPU concurrently writes
@@ -1080,7 +1084,7 @@ mod tests {
             let differs_2 =
                 std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec();
             assert_eq!(differs_2, vec![0, 0, 1, 0], "only page 2 should differ");
-            let written_2 = engine.finish_back(&host, plan2, &mut submitted);
+            let written_2 = engine.finish_back(&host, plan2, &mut submitted, u64::MAX);
             assert_eq!(written_2, 4, "tight dirty span should write exactly 4 GPU bytes");
             assert_eq!(&title[2 * PAGE + 128..2 * PAGE + 132], &gpu_bytes);
             assert_eq!(&title[2 * PAGE + 256..2 * PAGE + 260], &[0x11, 0x22, 0x33, 0x44]);
@@ -1097,7 +1101,7 @@ mod tests {
             let after3 = engine.record_after(&host, &plan3).expect("after3");
             host.execute_and_wait_locked(before3.unwrap(), &mut submitted);
             host.execute_and_wait_locked(after3, &mut submitted);
-            let written_3 = engine.finish_back(&host, plan3, &mut submitted);
+            let written_3 = engine.finish_back(&host, plan3, &mut submitted, u64::MAX);
             assert_eq!(written_3, 0, "after re-upload + re-hash, 0 bytes should differ");
 
             // Read back page 2 directly from VRAM and verify both GPU and CPU writes exist there.

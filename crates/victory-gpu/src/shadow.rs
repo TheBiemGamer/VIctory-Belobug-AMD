@@ -305,11 +305,12 @@ impl Shadow {
 
     /// Merges GPU-modified 64 KiB pieces (fetched from VRAM into `runs`:
     /// `(first_piece, count, readback_ptr)`) into title memory and `card.staging`.
-    /// Returns bytes written to title memory.
+    /// Returns bytes written to title memory. `submission` is the one that wrote them.
     pub(crate) fn merge_card_pieces(
         &self,
         card: &Arc<crate::card::CardState>,
         runs: &[(u32, u32, usize)],
+        submission: u64,
     ) -> usize {
         let start = self.start as usize;
         let shadow_len = self.len as usize;
@@ -341,6 +342,11 @@ impl Shadow {
                 if gpu_new == staging_old {
                     continue;
                 }
+                let remaps = crate::remap::held();
+                // As unwritten: staging takes the title's bytes and goes up to VRAM.
+                withhold(&remaps, submission, title_addr, n, |a, b| {
+                    staging_old[a..b].copy_from_slice(&gpu_new[a..b]);
+                });
                 let title_slice = &mut title_buf[..n];
                 if !crate::host::read_into(title_addr as *const u8, title_slice) {
                     // Unmapped in title memory: still sync staging to VRAM so
@@ -556,13 +562,13 @@ impl Shadow {
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    /// written. `submission` is the one that wrote them.
+    pub(crate) fn copy_back(&self, address: usize, len: usize, submission: u64) -> usize {
         if self.direct.is_some() || self.card.is_some() {
             return 0;
         }
         if let Some((root, s)) = self.sparse_root() {
-            return root.sparse_back(s, address, len);
+            return root.sparse_back(s, address, len, submission);
         }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Before {
@@ -594,6 +600,11 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 if unchanged.differs(start + at, host, old) {
+                    let remaps = crate::remap::held();
+                    // As unwritten: the copy takes the title's bytes there.
+                    withhold(&remaps, submission, start + at, n, |a, b| {
+                        host[a..b].copy_from_slice(&old[a..b]);
+                    });
                     let buf = title.get_or_insert_with(|| {
                         let mut v = pooled(PAGE);
                         v.resize(PAGE, 0);
@@ -1403,6 +1414,7 @@ pub(crate) fn filled(start: u64, end: u64) {
 /// The title mapped or unmapped memory in `[start, end)`.
 pub(crate) fn remapped(start: u64, end: u64) {
     use windows::core::Interface;
+    crate::remap::record(start as usize, end as usize, crate::host::started);
     filled(start, end);
     crate::memory::remapped(start, end);
     // Own copies (EXACT) stay: a slot made on one keeps it, and like a shared
@@ -2223,7 +2235,7 @@ impl Shadow {
     }
 
     /// [`Shadow::copy_back`] of a sparse copy, its tiles on several threads.
-    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+    fn sparse_back(&self, s: &Sparse, address: usize, len: usize, submission: u64) -> usize {
         let views = self.tiles_of(s, address, address + len);
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
@@ -2252,6 +2264,10 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+                let remaps = crate::remap::held();
+                withhold(&remaps, submission, at, n, |a, b| {
+                    host[a..b].copy_from_slice(&old[a..b]);
+                });
                 let buf = title.get_or_insert_with(|| {
                     let mut v = pooled(PAGE);
                     v.resize(PAGE, 0);
@@ -2283,6 +2299,33 @@ impl Shadow {
         }
         written
     }
+}
+
+/// Calls `keep` with the offsets in `[at, at + n)` that the title remapped
+/// after `submission` started: the GPU's bytes there were meant for the old
+/// mapping, and `keep` makes the merge see none.
+fn withhold(
+    remaps: &crate::remap::Held,
+    submission: u64,
+    at: usize,
+    n: usize,
+    mut keep: impl FnMut(usize, usize),
+) {
+    remaps.since(submission, at, at + n, |a, b| {
+        keep(a - at, b - at);
+        static SPANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let bytes = BYTES.fetch_add((b - a) as u64, Ordering::Relaxed) + (b - a) as u64;
+        let spans = SPANS.fetch_add(1, Ordering::Relaxed) + 1;
+        if spans.is_power_of_two() {
+            tracing::info!(
+                spans,
+                bytes,
+                submission,
+                "GPU writes withheld from title memory remapped while they were in flight"
+            );
+        }
+    });
 }
 
 /// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to

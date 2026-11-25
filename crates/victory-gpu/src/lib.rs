@@ -52,6 +52,8 @@ pub mod query;
 pub mod queue;
 mod readout;
 #[cfg(windows)]
+mod remap;
+#[cfg(windows)]
 mod rects;
 pub mod resource;
 pub mod root;
