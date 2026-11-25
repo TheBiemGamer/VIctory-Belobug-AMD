@@ -180,18 +180,21 @@ pub fn title() -> Title {
 /// about 4 ms per 5.3 ms block) and cannot tune the timer on the console;
 /// a desktop process waits in 15.6 ms ticks unless it asks for finer ones,
 /// and Windows 11 drops that request while the window is hidden unless the
-/// process opts out. Process-wide, for the whole run.
+/// process opts out; it opts out of efficiency mode (EcoQoS) too.
+/// Process-wide, for the whole run.
 #[cfg(windows)]
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE,
         ProcessPowerThrottling, SetProcessInformation,
     };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+            | PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
