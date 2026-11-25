@@ -4358,6 +4358,8 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
+        // Mesh lanes above come from the thread id: no wave op there.
+        self.s.flags |= flags::WAVE_OPS;
         self.s.op(
             self.cur,
             "waveGetLaneIndex",
