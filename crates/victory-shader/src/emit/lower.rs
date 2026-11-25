@@ -3736,6 +3736,7 @@ impl<'a> Lower<'a> {
             let t = self.s.m.bin(at, Bin::And, t, one);
             return self.s.m.cmp(at, pred::NE, t, z);
         }
+        self.s.flags |= flags::WAVE_OPS;
         let lane = self.s.op(
             at,
             "waveGetLaneIndex",
