@@ -1798,12 +1798,12 @@ fn sweeps() -> u8 {
 }
 
 /// Whether what shaders write into sparse copies is found on the GPU
-/// (`VICTORY_GPU_COMPARE=1`): their tiles are snapshotted and hashed there
+/// (`VICTORY_GPU_COMPARE`, on; `=0` off): their tiles are snapshotted and hashed there
 /// before and after the submission, and only tiles whose hash changed are
 /// read at copy-back, instead of CPU snapshots of every declared tile.
 pub(crate) fn compares() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !cfg!(test) && std::env::var_os("VICTORY_GPU_COMPARE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| !cfg!(test) && std::env::var_os("VICTORY_GPU_COMPARE").is_none_or(|v| v != "0"))
 }
 
 /// Gives back the tiles nothing has asked about for some frames: what

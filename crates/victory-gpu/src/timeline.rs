@@ -83,19 +83,19 @@ struct Late {
 }
 
 /// Whether a queue's signals are given by the finishing thread once the
-/// host work before them is finished (`VICTORY_ASYNC_SIGNAL=1`), so the
+/// host work before them is finished (`VICTORY_ASYNC_SIGNAL`, on; `=0` off), so the
 /// thread that submits them does not wait for the host GPU.
 fn async_signal() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SIGNAL").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SIGNAL").is_none_or(|v| v != "0"))
 }
 
 /// Whether a wait that unwaited host work may still owe holds its queue
 /// back while the finishing thread finishes that work
-/// (`VICTORY_GPU_WAITS=1`), instead of the submitting thread doing it.
+/// (`VICTORY_GPU_WAITS`, on; `=0` off), instead of the submitting thread doing it.
 fn gpu_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_WAITS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_WAITS").is_none_or(|v| v != "0"))
 }
 
 /// Host GPU work still to finish.
