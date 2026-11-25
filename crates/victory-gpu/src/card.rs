@@ -379,65 +379,11 @@ unsafe impl Send for CardEngine {}
 
 impl CardEngine {
     pub(crate) fn new(host: &Host) -> windows::core::Result<Self> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: valid HLSL source and entry point.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE_HLSL.as_ptr().cast(),
-                CARD_COMPARE_HLSL.len(),
-                windows::core::s!("card_compare_wave64"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
-        // SAFETY: valid compiled DXBC blob from D3DCompile.
-        let bytecode = unsafe {
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-        };
-        // SAFETY: bytecode embeds `[RootSignature(RS)]`.
-        let root_sig: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, bytecode)? };
-        let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::ManuallyDrop::new(Some(root_sig.clone())),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytecode.as_ptr().cast(),
-                BytecodeLength: bytecode.len(),
-            },
-            ..Default::default()
-        };
-        // SAFETY: valid compute pipeline description.
-        let pso_res: windows::core::Result<ID3D12PipelineState> =
-            unsafe { host.device.CreateComputePipelineState(&pso_desc) };
-        // Release our extra ref from `ManuallyDrop` above even on error.
-        drop(std::mem::ManuallyDrop::into_inner(pso_desc.pRootSignature));
-        let pso = pso_res?;
-
-        let make_pair = || -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
-            // SAFETY: plain direct command allocator and list creation.
-            unsafe {
-                let alloc: ID3D12CommandAllocator = host
-                    .device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &alloc,
-                    None,
-                )?;
-                list.Close()?;
-                Ok((alloc, list))
-            }
-        };
-        let (before_alloc, before_list) = make_pair()?;
-        let (after_alloc, after_list) = make_pair()?;
-        let (fetch_alloc, fetch_list) = make_pair()?;
+        let (root_sig, pso) =
+            compile(host, CARD_COMPARE_HLSL, windows::core::s!("card_compare_wave64"))?;
+        let (before_alloc, before_list) = command_pair(host)?;
+        let (after_alloc, after_list) = command_pair(host)?;
+        let (fetch_alloc, fetch_list) = command_pair(host)?;
 
         let init_diff_bytes = 256 << 10; // 65,536 pieces (4 GiB of ranges)
         let differs_gpu = host
@@ -944,6 +890,264 @@ impl CardEngine {
     }
 }
 
+/// Snapshot and change detection of sparse copies' tiles (`VICTORY_GPU_COMPARE=1`):
+/// before a submission's lists, one 64-thread group per tile copies it to
+/// `snapshot` and stores its hash; after them, it flags the tiles whose hash
+/// changed. Tile `first + i` of `tiles` uses slot `slot + i` of the rest.
+const TILE_COMPARE_HLSL: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer Run : register(b0) {
+    uint first;
+    uint slot;
+    uint count;
+    uint after;
+};
+ByteAddressBuffer tiles : register(t0);
+RWByteAddressBuffer snapshot : register(u0);
+RWByteAddressBuffer hashes : register(u1);
+RWByteAddressBuffer changed : register(u2);
+
+groupshared uint4 s_acc[64];
+
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
+    if (gid.x >= count) return;
+    uint src = (first + gid.x) * 65536u;
+    uint at_slot = slot + gid.x;
+    uint dst = at_slot * 65536u;
+
+    uint4 h = uint4(
+        0x9E3779B9u ^ (tid * 0x85EBCA6Bu),
+        0x85EBCA6Bu ^ (tid * 0xC2B2AE35u),
+        0xC2B2AE35u ^ (tid * 0x27D4EB2Fu),
+        0x27D4EB2Fu ^ (tid * 0x165667B1u)
+    );
+    [loop]
+    for (uint at = tid * 16u; at < 65536u; at += 1024u) {
+        uint4 v = tiles.Load4(src + at);
+        if (after == 0u) {
+            snapshot.Store4(dst + at, v);
+        }
+        h = (h ^ v) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    s_acc[tid] = h;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            uint4 a = s_acc[tid];
+            uint4 b = s_acc[tid + stride];
+            uint4 m = (a ^ (b * uint4(0x27D4EB2Fu, 0x165667B1u, 0x9E3779B9u, 0x85EBCA6Bu)))
+                    * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            s_acc[tid] = m.yzwx ^ (m >> 15);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (tid == 0u) {
+        if (after == 0u) {
+            hashes.Store4(at_slot * 16u, s_acc[0]);
+        } else {
+            changed.Store(at_slot * 4u, any(s_acc[0] != hashes.Load4(at_slot * 16u)) ? 1u : 0u);
+        }
+    }
+}
+"#;
+
+/// Tiles one submission snapshots at most (1 GiB): slot offsets stay in 32 bits.
+pub(crate) const MOST_TILES: usize = 16384;
+
+/// The CPU's views of a submission's tile snapshot (`PAGE` bytes per slot)
+/// and changed flags (a `u32` per slot), valid until the next
+/// [`TileCompare::record`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TileViews {
+    pub(crate) snapshot: usize,
+    pub(crate) changed: usize,
+}
+
+/// See [`TILE_COMPARE_HLSL`]. Used under `Host::submitted`, one submission at a time.
+pub(crate) struct TileCompare {
+    root_sig: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    before: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    after: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// Room in slots.
+    slots: usize,
+    /// The snapshot and changed flags (CPU-mapped, with their views) and the hashes.
+    buffers: Option<(ID3D12Resource, ID3D12Resource, ID3D12Resource, TileViews)>,
+}
+
+// SAFETY: D3D12 interfaces are free-threaded; used behind a mutex.
+unsafe impl Send for TileCompare {}
+
+impl TileCompare {
+    pub(crate) fn new(host: &Host) -> windows::core::Result<Self> {
+        let (root_sig, pso) =
+            compile(host, TILE_COMPARE_HLSL, windows::core::s!("tile_compare"))?;
+        Ok(Self {
+            root_sig,
+            pso,
+            before: command_pair(host)?,
+            after: command_pair(host)?,
+            slots: 0,
+            buffers: None,
+        })
+    }
+
+    fn ensure_slots(&mut self, host: &Host, slots: usize) -> bool {
+        if slots <= self.slots && self.buffers.is_some() {
+            return true;
+        }
+        let room = slots.next_power_of_two().clamp(256, MOST_TILES);
+        let Some((snapshot, snapshot_at)) = host.shared_buffer((room * PAGE) as u64) else {
+            return false;
+        };
+        let Some((changed, changed_at)) = host.shared_buffer((room * 4) as u64) else {
+            return false;
+        };
+        let Some(hashes) = host.uav_buffer((room * 16) as u64) else {
+            return false;
+        };
+        crate::host::name(&snapshot, || format!("tile snapshot {room} tiles"));
+        crate::host::name(&changed, || "tile changed flags".into());
+        crate::host::name(&hashes, || "tile hashes".into());
+        let views = TileViews {
+            snapshot: snapshot_at as usize,
+            changed: changed_at as usize,
+        };
+        if let Some((a, b, c, _)) = self.buffers.replace((snapshot, changed, hashes, views)) {
+            crate::host::retire((a, b, c));
+        }
+        self.slots = room;
+        true
+    }
+
+    /// Records the lists that run before and after a submission's own for
+    /// `roots`: sparse buffers and their tiles (mapped, sorted, distinct).
+    /// Root `i`'s tiles take the slots after root `i - 1`'s. `None`: nothing
+    /// was recorded (too many tiles, or no memory), so the CPU must snapshot.
+    pub(crate) fn record(
+        &mut self,
+        host: &Host,
+        roots: &[(&ID3D12Resource, &[u32])],
+    ) -> Option<(ID3D12CommandList, ID3D12CommandList, TileViews)> {
+        let total: usize = roots.iter().map(|(_, t)| t.len()).sum();
+        if total == 0 || total > MOST_TILES || !self.ensure_slots(host, total) {
+            return None;
+        }
+        let (snapshot, changed, hashes, views) = self.buffers.as_ref()?;
+        let mut open = Vec::with_capacity(2);
+        for (alloc, list) in [&self.before, &self.after] {
+            // SAFETY: the submission that last ran these lists is done
+            // (submissions run one at a time under `Host::submitted`).
+            unsafe {
+                alloc.Reset().ok()?;
+                list.Reset(alloc, None).ok()?;
+                list.SetComputeRootSignature(&self.root_sig);
+                list.SetPipelineState(&self.pso);
+            }
+            open.push(list);
+        }
+        let (before, after) = (open[0], open[1]);
+        // SAFETY: an open list.
+        unsafe { after.ResourceBarrier(&[uav_barrier()]) };
+        let mut slot = 0u32;
+        for (buffer, tiles) in roots {
+            let mut i = 0;
+            while i < tiles.len() {
+                let mut n = 1;
+                while i + n < tiles.len() && tiles[i + n] == tiles[i] + n as u32 {
+                    n += 1;
+                }
+                for (list, pass) in [(before, 0u32), (after, 1)] {
+                    let constants = [tiles[i], slot, n as u32, pass];
+                    // SAFETY: an open list with the root signature bound; live
+                    // buffers covering every tile and slot named (`total <= self.slots`).
+                    unsafe {
+                        list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                        list.SetComputeRootShaderResourceView(1, buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(2, snapshot.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(3, hashes.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(4, changed.GetGPUVirtualAddress());
+                        list.Dispatch(n as u32, 1, 1);
+                    }
+                }
+                slot += n as u32;
+                i += n;
+            }
+        }
+        // SAFETY: open lists.
+        unsafe {
+            before.Close().ok()?;
+            after.Close().ok()?;
+        }
+        Some((before.cast().ok()?, after.cast().ok()?, *views))
+    }
+}
+
+/// Compiles a compute shader that embeds its root signature (`RS`).
+fn compile(
+    host: &Host,
+    hlsl: &str,
+    name: windows::core::PCSTR,
+) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+    let mut code: Option<ID3DBlob> = None;
+    // SAFETY: valid HLSL source and entry point.
+    unsafe {
+        D3DCompile(
+            hlsl.as_ptr().cast(),
+            hlsl.len(),
+            name,
+            None,
+            None,
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            None,
+        )?;
+    }
+    let code = code.ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: valid compiled DXBC blob from D3DCompile.
+    let bytecode = unsafe {
+        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+    };
+    // SAFETY: bytecode embeds `[RootSignature(RS)]`.
+    let root_sig: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, bytecode)? };
+    let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(root_sig.clone())),
+        CS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytecode.as_ptr().cast(),
+            BytecodeLength: bytecode.len(),
+        },
+        ..Default::default()
+    };
+    // SAFETY: valid compute pipeline description.
+    let pso_res: windows::core::Result<ID3D12PipelineState> =
+        unsafe { host.device.CreateComputePipelineState(&pso_desc) };
+    // Release our extra ref from `ManuallyDrop` above even on error.
+    drop(std::mem::ManuallyDrop::into_inner(pso_desc.pRootSignature));
+    Ok((root_sig, pso_res?))
+}
+
+/// A closed direct command list and its allocator.
+fn command_pair(host: &Host) -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+    // SAFETY: plain direct command allocator and list creation.
+    unsafe {
+        let alloc: ID3D12CommandAllocator =
+            host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let list: ID3D12GraphicsCommandList =
+            host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
+        list.Close()?;
+        Ok((alloc, list))
+    }
+}
+
 fn transition_barrier(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -1121,6 +1325,89 @@ mod tests {
             let vram_page2 = std::slice::from_raw_parts(rb_ptr, PAGE);
             assert_eq!(&vram_page2[128..132], &gpu_bytes);
             assert_eq!(&vram_page2[256..260], &[0x11, 0x22, 0x33, 0x44]);
+        }
+    }
+
+    #[test]
+    fn warp_tile_compare_snapshots_at_submission_and_flags_changed_tiles() {
+        let Some(host) = Host::new_warp() else {
+            return;
+        };
+        let mut engine = TileCompare::new(&host).expect("TileCompare should build on WARP");
+        let (a, a_at) = host.shared_buffer((4 * PAGE) as u64).expect("buffer a");
+        let (b, b_at) = host.shared_buffer((2 * PAGE) as u64).expect("buffer b");
+        // SAFETY: both mappings cover their buffers; no GPU work runs yet.
+        let (a_bytes, b_bytes) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a_at, 4 * PAGE),
+                std::slice::from_raw_parts_mut(b_at, 2 * PAGE),
+            )
+        };
+        for (i, x) in a_bytes.iter_mut().enumerate() {
+            *x = (i.wrapping_mul(7) ^ (i >> 9)) as u8;
+        }
+        for (i, x) in b_bytes.iter_mut().enumerate() {
+            *x = (i.wrapping_mul(13) ^ (i >> 7)) as u8;
+        }
+        assert!(
+            engine.record(&host, &[(&a, vec![0u32; MOST_TILES + 1].as_slice())]).is_none(),
+            "too many tiles: the CPU snapshots"
+        );
+        let (patch, patch_at) = host.shared_buffer(256).expect("patch buffer");
+        let gpu_bytes = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        // SAFETY: the patch buffer maps 256 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(gpu_bytes.as_ptr(), patch_at, 4) };
+        let mut submitted = 0u64;
+
+        for round in 0..2 {
+            let (before, after, views) = engine
+                .record(&host, &[(&a, &[0u32, 2, 3][..]), (&b, &[1u32][..])])
+                .expect("lists");
+            // Written after recording but before the submission runs: part of the snapshot.
+            a_bytes[2 * PAGE + 10] ^= 0x5A;
+            let expected = [
+                a_bytes[..PAGE].to_vec(),
+                a_bytes[2 * PAGE..3 * PAGE].to_vec(),
+                a_bytes[3 * PAGE..].to_vec(),
+                b_bytes[PAGE..].to_vec(),
+            ];
+            host.execute_and_wait_locked(before, &mut submitted);
+            if round == 0 {
+                // SAFETY: plain object creation and a copy between live buffers.
+                unsafe {
+                    let alloc: ID3D12CommandAllocator = host
+                        .device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                        .expect("alloc");
+                    let list: ID3D12GraphicsCommandList = host
+                        .device
+                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                        .expect("list");
+                    list.CopyBufferRegion(&a, (3 * PAGE + 128) as u64, &patch, 0, 4);
+                    list.Close().expect("close");
+                    host.execute_and_wait_locked(list.cast().expect("cast"), &mut submitted);
+                }
+            }
+            host.execute_and_wait_locked(after, &mut submitted);
+            // SAFETY: four slots' flags and snapshots, written by now.
+            let (changed, snapshot) = unsafe {
+                (
+                    std::slice::from_raw_parts(views.changed as *const u32, 4).to_vec(),
+                    std::slice::from_raw_parts(views.snapshot as *const u8, 4 * PAGE),
+                )
+            };
+            let flags = if round == 0 { vec![0, 0, 1, 0] } else { vec![0, 0, 0, 0] };
+            assert_eq!(changed, flags, "round {round}: only the tile the GPU wrote changed");
+            for (slot, want) in expected.iter().enumerate() {
+                assert!(
+                    snapshot[slot * PAGE..(slot + 1) * PAGE] == want[..],
+                    "round {round}: slot {slot} holds its tile from before the submission"
+                );
+            }
+            if round == 0 {
+                assert_eq!(&a_bytes[3 * PAGE + 128..3 * PAGE + 132], &gpu_bytes);
+                assert_ne!(&snapshot[2 * PAGE + 128..2 * PAGE + 132], &gpu_bytes);
+            }
         }
     }
 }

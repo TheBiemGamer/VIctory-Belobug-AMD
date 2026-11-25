@@ -1647,6 +1647,8 @@ struct Sparse {
     tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
     /// What tiles shaders write held before the submission.
     before: Mutex<std::collections::HashMap<u32, Vec<u8>, Mix>>,
+    /// The same kept by the GPU instead ([`compares`]).
+    compared: Mutex<Compared>,
     /// By tile: the frame to look at it next in, and how often in a row it
     /// had not changed.
     looks: Mutex<std::collections::HashMap<u32, Arc<Mutex<Look>>, Mix>>,
@@ -1656,6 +1658,32 @@ struct Sparse {
     aliases: Mutex<Vec<Arc<Shadow>>>,
     /// This is an alias of that one.
     of: Option<Arc<Shadow>>,
+}
+
+/// [`compares`]: tiles shaders write, snapshotted and hashed on the GPU.
+#[derive(Default)]
+struct Compared {
+    /// Declared this submission, before it is recorded.
+    marked: std::collections::BTreeSet<u32>,
+    /// Each declared tile's slot in the snapshot, once recorded.
+    slots: std::collections::HashMap<u32, u32, Mix>,
+    /// The snapshot and the changed flags; flags at 0: every tile counts as changed.
+    views: crate::card::TileViews,
+}
+
+impl Compared {
+    /// What the GPU kept of `tile` from the byte `at` on: `None` if it kept
+    /// nothing, `Some(None)` if the tile did not change.
+    fn old(&self, tile: u32, at: usize) -> Option<Option<usize>> {
+        let slot = *self.slots.get(&tile)? as usize;
+        let changed = self.views.changed as *const u32;
+        // SAFETY: a flag per slot, written by the GPU before the
+        // submission's fence, which has passed.
+        if !changed.is_null() && unsafe { changed.add(slot).read_volatile() } == 0 {
+            return Some(None);
+        }
+        Some(Some(self.views.snapshot + slot * PAGE + at))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1767,6 +1795,15 @@ fn sweeps() -> u8 {
         }
         std::env::var("VICTORY_SWEEP_TILES").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
     })
+}
+
+/// Whether what shaders write into sparse copies is found on the GPU
+/// (`VICTORY_GPU_COMPARE=1`): their tiles are snapshotted and hashed there
+/// before and after the submission, and only tiles whose hash changed are
+/// read at copy-back, instead of CPU snapshots of every declared tile.
+pub(crate) fn compares() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !cfg!(test) && std::env::var_os("VICTORY_GPU_COMPARE").is_some_and(|v| v == "1"))
 }
 
 /// Gives back the tiles nothing has asked about for some frames: what
@@ -1992,6 +2029,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         sparse: Some(Sparse {
             tiles: Mutex::default(),
             before: Mutex::default(),
+            compared: Mutex::default(),
             looks: Mutex::default(),
             kept: Mutex::default(),
             aliases: Mutex::default(),
@@ -2206,47 +2244,119 @@ impl Shadow {
             return;
         }
         let views = self.tiles_of(s, address, end);
-        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
+        if compares() {
+            let mut compared = s.compared.lock().unwrap_or_else(|e| e.into_inner());
+            compared.marked.extend(views.iter().map(|&(at, _, _)| ((at - start) / PAGE) as u32));
+            return;
+        }
+        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         // (tile, the start of its view) of tiles without a snapshot yet.
         let new: Vec<(u32, usize)> = views
             .iter()
             .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data & !(PAGE - 1)))
             .filter(|(tile, _)| !before.contains_key(tile))
             .collect();
-        if new.is_empty() {
-            return;
-        }
-        #[cfg(feature = "diagnostics")]
-        SPARSE_WRITES[1].fetch_add((new.len() * PAGE) as u64, Ordering::Relaxed);
-        let mut bufs = pooled_tiles(new.len());
-        let copies: Vec<(usize, usize)> =
-            new.iter().zip(&mut bufs).map(|(&(_, view), buf)| (view, buf.as_mut_ptr() as usize)).collect();
-        crate::host::in_parallel(&copies, 16, |chunk| {
-            for &(view, buf) in chunk {
-                // SAFETY: the tile's mapping; a buffer with room for a tile,
-                // each written by one thread.
-                unsafe { std::ptr::copy_nonoverlapping(view as *const u8, buf as *mut u8, PAGE) };
-            }
-        });
-        for (&(tile, _), mut buf) in new.iter().zip(bufs) {
-            // SAFETY: filled above, within its capacity.
-            unsafe { buf.set_len(PAGE) };
-            before.insert(tile, buf);
-        }
+        snapshot_tiles(&mut before, &new);
     }
 
+    /// [`compares`]: takes the tiles declared since the last submission.
+    fn take_marked(&self) -> Vec<u32> {
+        let Some((_, s)) = self.sparse_root() else {
+            return Vec::new();
+        };
+        let mut compared = s.compared.lock().unwrap_or_else(|e| e.into_inner());
+        // Slots left from an earlier submission name memory this one reuses.
+        compared.slots.clear();
+        std::mem::take(&mut compared.marked).into_iter().collect()
+    }
+
+    /// [`compares`]: the GPU snapshots `tiles` of this sparse copy (its root)
+    /// into the slots from `first` on and flags those that change.
+    pub(crate) fn compared(&self, tiles: &[u32], first: u32, views: crate::card::TileViews) {
+        let Some((_, s)) = self.sparse_root() else { return };
+        let mut compared = s.compared.lock().unwrap_or_else(|e| e.into_inner());
+        compared.slots = tiles.iter().zip(first..).map(|(&tile, slot)| (tile, slot)).collect();
+        compared.views = views;
+        #[cfg(feature = "diagnostics")]
+        SPARSE_WRITES[1].fetch_add((tiles.len() * PAGE) as u64, Ordering::Relaxed);
+    }
+
+    /// [`compares`] without the GPU: snapshots `tiles` on the CPU, before
+    /// the submission runs, as without it.
+    pub(crate) fn snapshot_marked(&self, tiles: &[u32]) {
+        let Some((_, s)) = self.sparse_root() else { return };
+        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+        let new: Vec<(u32, usize)> = {
+            let known = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+            tiles
+                .iter()
+                .filter(|tile| !before.contains_key(tile))
+                .filter_map(|tile| Some((*tile, known.get(tile)?.data)))
+                .collect()
+        };
+        snapshot_tiles(&mut before, &new);
+    }
+}
+
+/// Snapshots tiles (`(tile, the start of its view)`) on several threads.
+fn snapshot_tiles(before: &mut std::collections::HashMap<u32, Vec<u8>, Mix>, new: &[(u32, usize)]) {
+    if new.is_empty() {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    SPARSE_WRITES[1].fetch_add((new.len() * PAGE) as u64, Ordering::Relaxed);
+    let mut bufs = pooled_tiles(new.len());
+    let copies: Vec<(usize, usize)> =
+        new.iter().zip(&mut bufs).map(|(&(_, view), buf)| (view, buf.as_mut_ptr() as usize)).collect();
+    crate::host::in_parallel(&copies, 16, |chunk| {
+        for &(view, buf) in chunk {
+            // SAFETY: the tile's mapping; a buffer with room for a tile,
+            // each written by one thread.
+            unsafe { std::ptr::copy_nonoverlapping(view as *const u8, buf as *mut u8, PAGE) };
+        }
+    });
+    for (&(tile, _), mut buf) in new.iter().zip(bufs) {
+        // SAFETY: filled above, within its capacity.
+        unsafe { buf.set_len(PAGE) };
+        before.insert(tile, buf);
+    }
+}
+
+/// [`compares`]: the sparse copies (roots, once each) `back` writes, with
+/// the tiles declared since the last submission.
+pub(crate) fn marked_tiles(back: &[(Arc<Shadow>, usize, usize)]) -> Vec<(&Shadow, Vec<u32>)> {
+    let mut roots: Vec<(&Shadow, Vec<u32>)> = Vec::new();
+    for (shadow, _, _) in back {
+        let Some((root, _)) = shadow.sparse_root() else { continue };
+        if roots.iter().any(|(r, _)| std::ptr::eq(*r, root)) {
+            continue;
+        }
+        let tiles = root.take_marked();
+        if !tiles.is_empty() {
+            roots.push((root, tiles));
+        }
+    }
+    roots
+}
+
+impl Shadow {
     /// [`Shadow::copy_back`] of a sparse copy, its tiles on several threads.
     fn sparse_back(&self, s: &Sparse, address: usize, len: usize, submission: u64) -> usize {
         let views = self.tiles_of(s, address, address + len);
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut compared = s.compared.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
         // (title address, view, length, the snapshot's bytes): one tile each,
         // so no two touch the same memory.
         let work: Vec<(usize, usize, usize, usize)> = views
             .iter()
             .filter_map(|&(at, data, n)| {
-                let old = before.get_mut(&(((at - start) / PAGE) as u32))?;
+                let tile = ((at - start) / PAGE) as u32;
+                if let Some(old) = compared.old(tile, at % PAGE) {
+                    return old.map(|old| (at, data, n, old));
+                }
+                let old = before.get_mut(&tile)?;
                 Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE))
             })
             .collect();
@@ -2256,8 +2366,8 @@ impl Shadow {
             for &(at, data, n, old) in chunk {
                 // SAFETY: the tile's mapping; this tile is this thread's alone.
                 let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
-                // SAFETY: the tile's snapshot, kept under the lock held above
-                // (nothing is inserted meanwhile); this thread's alone.
+                // SAFETY: the tile's snapshot (ours or the GPU's), kept under
+                // the locks held above; this thread's alone.
                 let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
                 #[cfg(feature = "diagnostics")]
                 SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
@@ -2298,6 +2408,7 @@ impl Shadow {
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty() {
             give_back_tiles(before.drain().map(|(_, buf)| buf));
+            compared.slots.clear();
         }
         written
     }
@@ -2959,6 +3070,27 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    #[test]
+    fn gpu_compared_tiles_are_read_only_where_their_hash_changed() {
+        let snapshot = vec![0u8; 3 * PAGE];
+        let changed = [0u32, 1, 0];
+        let mut compared = Compared {
+            slots: [(7, 0), (9, 1), (12, 2)].into_iter().collect(),
+            views: crate::card::TileViews {
+                snapshot: snapshot.as_ptr() as usize,
+                changed: changed.as_ptr() as usize,
+            },
+            ..Compared::default()
+        };
+        let base = snapshot.as_ptr() as usize;
+        assert_eq!(compared.old(8, 0), None, "not compared on the GPU: the CPU's snapshot counts");
+        assert_eq!(compared.old(7, 5), Some(None), "unchanged: skipped");
+        assert_eq!(compared.old(9, 5), Some(Some(base + PAGE + 5)));
+        assert_eq!(compared.old(12, 0), Some(None));
+        compared.views.changed = 0;
+        assert_eq!(compared.old(12, 3), Some(Some(base + 2 * PAGE + 3)), "no flags: every tile is compared");
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {

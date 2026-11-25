@@ -132,6 +132,8 @@ pub(crate) struct Host {
     presenter: Mutex<Option<Presenter>>,
     /// Device-local VRAM card buffer engine (Wave64 GPU page hashing), lazily initialized.
     card: OnceLock<Option<Mutex<crate::card::CardEngine>>>,
+    /// Snapshots and hashes of sparse copies' tiles ([`crate::shadow::compares`]), lazily.
+    compare: OnceLock<Option<Mutex<crate::card::TileCompare>>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -531,6 +533,7 @@ impl Host {
                 next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
                 card: OnceLock::new(),
+                compare: OnceLock::new(),
             })
         }
     }
@@ -551,6 +554,46 @@ impl Host {
                 }
             })
             .as_ref()
+    }
+
+    /// [`crate::shadow::compares`]: the lists that snapshot and hash the
+    /// tiles of the sparse copies `back` writes, to run before and after
+    /// the submission's own. Without them the CPU snapshots the tiles now.
+    fn compare_sparse(
+        &self,
+        back: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    ) -> (Option<ID3D12CommandList>, Option<ID3D12CommandList>) {
+        if !crate::shadow::compares() {
+            return (None, None);
+        }
+        let roots = crate::shadow::marked_tiles(back);
+        if roots.is_empty() {
+            return (None, None);
+        }
+        let engine = self.compare.get_or_init(|| match crate::card::TileCompare::new(self) {
+            Ok(engine) => Some(Mutex::new(engine)),
+            Err(e) => {
+                tracing::warn!(error = %e, "no GPU compare of sparse copies; the CPU snapshots them");
+                None
+            }
+        });
+        let buffers: Vec<(&ID3D12Resource, &[u32])> =
+            roots.iter().map(|(root, tiles)| (&root.buffer, tiles.as_slice())).collect();
+        let recorded = engine
+            .as_ref()
+            .and_then(|e| e.lock().unwrap_or_else(|e| e.into_inner()).record(self, &buffers));
+        let Some((before, after, views)) = recorded else {
+            for (root, tiles) in &roots {
+                root.snapshot_marked(tiles);
+            }
+            return (None, None);
+        };
+        let mut first = 0;
+        for (root, tiles) in &roots {
+            root.compared(tiles, first, views);
+            first += tiles.len() as u32;
+        }
+        (Some(before), Some(after))
     }
 
     pub(crate) fn card_ready(&self) -> bool {
@@ -1451,6 +1494,7 @@ impl Host {
             } else {
                 (None, None, None)
             };
+        let (sparse_before, mut sparse_after) = self.compare_sparse(&cpu_back);
         let prepared = std::time::Instant::now();
         // Each run (prelude and list) is a submission of its own: the host
         // resets the device when one submission runs for about 2 s, and
@@ -1480,6 +1524,11 @@ impl Host {
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&[Some(card_before)]) };
         }
+        // Always run once recorded: copy-back trusts its snapshot.
+        if let Some(sparse_before) = sparse_before {
+            // SAFETY: a closed list.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(sparse_before)]) };
+        }
         let mut async_signalled = false;
         let mut card_after_ran = false;
         for (i, group) in groups.iter().enumerate() {
@@ -1503,6 +1552,12 @@ impl Host {
                 // SAFETY: closed list; runs immediately after the final group under the same fence.
                 unsafe { self.queue.ExecuteCommandLists(&[Some(after)]) };
                 card_after_ran = true;
+            }
+            if !each
+                && let Some(after) = sparse_after.take()
+            {
+                // SAFETY: a closed list, after the last group under the same fence.
+                unsafe { self.queue.ExecuteCommandLists(&[Some(after)]) };
             }
             *submitted += 1;
             let fence_val = *submitted;
@@ -1557,6 +1612,9 @@ impl Host {
                 self.execute_and_wait_locked(after, &mut submitted);
                 card_after_ran = true;
             }
+        }
+        if let Some(after) = sparse_after.take() {
+            self.execute_and_wait_locked(after, &mut submitted);
         }
         if async_signalled {
             if let Some(plan) = card_plan {
