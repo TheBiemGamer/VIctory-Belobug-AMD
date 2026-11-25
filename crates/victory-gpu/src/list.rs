@@ -493,6 +493,33 @@ pub(crate) struct Barrier {
     last: u64,
 }
 
+/// A UAV barrier for `texture`: names `texture` when it has
+/// `ALLOW_UNORDERED_ACCESS`, else falls back to a global UAV barrier.
+/// Naming a host texture without `ALLOW_UNORDERED_ACCESS` (such as a depth
+/// texture whose console copy allowed UAVs) triggers D3D12 validation error
+/// `id=523` (Missing resource bind flags) and makes `Close()` return
+/// `E_INVALIDARG`.
+#[cfg(windows)]
+fn uav_barrier_for(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> Barrier {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    use windows::core::Interface;
+    // SAFETY: a plain query on a live host resource.
+    let allows_uav = unsafe { texture.GetDesc() }.Flags.0
+        & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0
+        != 0;
+    if allows_uav {
+        Barrier {
+            kind: 2,
+            flags: 0,
+            first: texture.as_raw().cast_const().cast(),
+            second: 0,
+            last: 0,
+        }
+    } else {
+        UAV_BARRIER
+    }
+}
+
 /// The barrier on host resources, or `None` if it names a resource the host
 /// GPU does not have (buffers so far).
 #[cfg(windows)]
@@ -510,12 +537,17 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
             let (texture, before) = list.transition(b.first, wanted)?;
+            let before = crate::host::legal_state(texture, before);
+            let after = crate::host::legal_state(texture, wanted);
+            if before == after {
+                return None;
+            }
             Some(Barrier {
                 kind: 0,
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(after),
             })
         }
         1 => Some(Barrier {
@@ -531,14 +563,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             },
             ..*b
         }),
-        2 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
+        2 => {
+            if b.first.is_null() {
+                Some(UAV_BARRIER)
             } else {
-                host(b.first)?
-            },
-            ..*b
-        }),
+                Some(uav_barrier_for(crate::resource::host_resource(b.first)?))
+            }
+        }
         _ => None,
     }
 }
@@ -1125,17 +1156,10 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        ensure_state(&list, record.resource, RENDER_TARGET);
         let rtv = host.rtv(texture, record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
-                use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
-                    texture,
-                    State(before as i32),
-                    State(RENDER_TARGET as i32),
-                )]);
-            }
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -2179,4 +2203,79 @@ mod tests {
         }
     }
 
+    /// A UAV barrier naming a host texture without `ALLOW_UNORDERED_ACCESS`
+    /// (such as a depth texture) falls back to a global UAV barrier so the
+    /// command list records and closes cleanly on strict D3D12 drivers.
+    #[cfg(windows)]
+    #[test]
+    fn uav_barrier_on_non_uav_texture_falls_back_to_global() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let make_tex = |format, flags, initial| -> ID3D12Resource {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            // SAFETY: valid D3D12 texture creation on the live host device.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        initial,
+                        None,
+                        &mut res,
+                    )
+                    .unwrap();
+            }
+            res.unwrap()
+        };
+        let depth = make_tex(
+            DXGI_FORMAT_R32_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        );
+        let uav_tex = make_tex(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let b_depth = uav_barrier_for(&depth);
+        assert_eq!(b_depth.kind, 2);
+        assert!(
+            b_depth.first.is_null(),
+            "depth texture must fall back to global UAV barrier"
+        );
+        let b_uav = uav_barrier_for(&uav_tex);
+        assert_eq!(b_uav.kind, 2);
+        assert!(!b_uav.first.is_null(), "UAV texture keeps its resource pointer");
+        // Verify both barriers record and close cleanly on a live host command list.
+        let list = host.new_list().expect("host command list");
+        // SAFETY: identical layout to D3D12_RESOURCE_BARRIER; live resources.
+        unsafe {
+            let barriers = [
+                std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(b_depth),
+                std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(b_uav),
+            ];
+            list.list.ResourceBarrier(&barriers);
+            list.list.Close().expect("command list must close cleanly");
+        }
+    }
 }
