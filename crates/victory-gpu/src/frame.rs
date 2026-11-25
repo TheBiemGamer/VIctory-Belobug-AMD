@@ -191,14 +191,38 @@ pub(crate) extern "system" fn wait(
     hr
 }
 
+/// Calls of [`statistics`] so far.
+static STATISTICS_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// Device method: no statistics are kept, so none are returned.
+///
+/// shortcut: what the output records hold is not known, so none are
+/// written. Diagnostics builds log the 1st, 2nd, 4th, 8th... call with its
+/// arguments: whether the title asks at all, and what for.
 pub(crate) extern "system" fn statistics(
     _: This,
-    _token: u64,
-    _kinds: u32,
+    token: u64,
+    kinds: u32,
     count: *mut u32,
-    _out: *mut u8,
+    out: *mut u8,
 ) -> HRESULT {
+    let call = STATISTICS_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(feature = "diagnostics")]
+    if call.is_power_of_two() {
+        // SAFETY: the title passes its count, or null.
+        let asked = unsafe { count.as_ref() }.copied();
+        tracing::info!(
+            call,
+            token,
+            kinds,
+            asked,
+            out = !out.is_null(),
+            frame = current(),
+            "frame statistics asked for (none returned)"
+        );
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (call, token, kinds, out);
     if !count.is_null() {
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
@@ -254,6 +278,23 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP, Duration::ZERO);
         assert!(tick > flips[3]);
+    }
+
+    /// Statistics are counted as asked for, and none are returned.
+    #[test]
+    fn statistics_return_none_and_are_counted() {
+        let before = STATISTICS_CALLS.load(Ordering::Relaxed);
+        let mut count = 4;
+        let mut out = [0xaau8; 64];
+        let hr = statistics(std::ptr::null(), 7, 1, &mut count, out.as_mut_ptr());
+        assert_eq!((hr, count), (S_OK, 0));
+        assert!(
+            out.iter().all(|&b| b == 0xaa),
+            "nothing written to the records"
+        );
+        let null = std::ptr::null_mut();
+        assert_eq!(statistics(std::ptr::null(), 0, 0, null, null.cast()), S_OK);
+        assert!(STATISTICS_CALLS.load(Ordering::Relaxed) >= before + 2);
     }
 
     /// Two waits for one kind that begin together (two threads) take two
