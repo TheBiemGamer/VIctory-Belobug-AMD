@@ -1679,3 +1679,48 @@ fn scalar_counted_in_nested_divergent_loops() {
         "inner iterations counted: {got:?}"
     );
 }
+
+/// The wave size a translation asks the host for: `PSV0`'s minimum and
+/// maximum wave lane counts.
+fn psv_wave_range(shader: &HostShader) -> (u32, u32) {
+    let c = crate::dxbc::Container::parse(&shader.dxil).unwrap();
+    let psv = c.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+    let u = |at: usize| u32::from_le_bytes(psv[at..at + 4].try_into().unwrap());
+    (u(4 + 16), u(4 + 20))
+}
+
+/// What the two tests above need of the host, checked without one: a
+/// scalar read after a loop that lanes leave at different iterations asks
+/// for the console's wave size (a driver left to choose may run a wave64
+/// program as wave32, and count the iterations of half the console wave).
+/// The same count in a loop every lane leaves together asks for nothing.
+#[test]
+fn scalars_read_after_a_divergent_loop_ask_for_the_console_wave_size() {
+    let divergent = [
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x8106_8106, // loop: s_add_u32 s6, s6, 1
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        0x7E00_0206, // v_mov_b32 v0, s6
+    ];
+    let uniform = [
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x8106_8106, // loop: s_add_u32 s6, s6, 1
+        0xBF0A_8406, // s_cmp_lt_u32 s6, 4
+        0xBF85_FFFD, // s_cbranch_scc1 loop
+        0x7E00_0206, // v_mov_b32 v0, s6
+    ];
+    let range = |body: &[u32]| {
+        psv_wave_range(&build_lanes_cs(body).unwrap_or_else(|e| panic!("translation: {e}")))
+    };
+    assert_eq!(range(&divergent), (64, 64));
+    assert_eq!(range(&uniform), (0, u32::MAX));
+}

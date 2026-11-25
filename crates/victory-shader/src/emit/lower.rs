@@ -12464,12 +12464,14 @@ impl<'a> Lower<'a> {
                     Val::Missing(_) => return None,
                 })
             };
+            let mut took = false;
             for v in values {
                 let Some(val) = self.vals.get(&v).copied() else {
                     continue;
                 };
                 if let Some(f) = final_of(self, val) {
                     self.finals.insert(v, (f, h));
+                    took = true;
                 }
             }
             // This block's joins of the loop's scalars.
@@ -12483,9 +12485,49 @@ impl<'a> Lower<'a> {
                     && let Some(f) = final_of(self, val)
                 {
                     self.vals.insert(phi.value, f);
+                    took = true;
                 }
             }
+            // The wave maximum above is over the host's wave: it stands for
+            // the console's only in a wave of the console's size. Lanes leave
+            // a loop at different iterations only through a branch over more
+            // than uniform values, so only then is the host asked for it (a
+            // host left to choose may run a wave64 program as wave32).
+            if took
+                && self.s.wave_size.is_none()
+                && self.x.native.wave64
+                && self.x.target.runs(64)
+                && self.divergent_exit(h)
+            {
+                self.s.wave_size = Some(64);
+            }
         }
+    }
+
+    /// Whether lanes can leave the loop headed by `h` at different
+    /// iterations: a branch in its body out of it whose condition is not
+    /// over [`Atom::Uniform`]s only.
+    fn divergent_exit(&self, h: usize) -> bool {
+        let Some(body) = self.loop_bodies.get(&h) else {
+            return false;
+        };
+        body.iter().any(|&b| match self.x.st.exits[b] {
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } => {
+                (!body.contains(&taken) || !body.contains(&not_taken))
+                    && !self
+                        .x
+                        .st
+                        .bools
+                        .support(when)
+                        .iter()
+                        .all(|a| matches!(a, Atom::Uniform(_)))
+            }
+            _ => false,
+        })
     }
 
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
