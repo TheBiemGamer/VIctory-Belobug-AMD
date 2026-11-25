@@ -395,6 +395,26 @@ pub(crate) fn wait_in_flight_if_ready() {
     }
 }
 
+/// The host fence value of the newest unwaited submission; 0 if none.
+pub(crate) fn owed() -> u64 {
+    match HOST.get() {
+        Some(Some(h)) => h
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .back()
+            .map_or(0, |f| f.fence),
+        _ => 0,
+    }
+}
+
+/// See [`Host::finish_to`].
+pub(crate) fn finish_to(target: u64) {
+    if let Some(Some(h)) = HOST.get() {
+        h.finish_to(target);
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
     crate::drvwatch::start();
     // SAFETY: plain D3D12 object creation with valid descriptions.
@@ -1270,6 +1290,25 @@ impl Host {
                 }
             }
         }
+        self.reap_completed();
+    }
+
+    /// As [`Host::wait_fence`], off the submitting thread
+    /// (`crate::timeline`): `submitted` is only taken once the host GPU
+    /// reached `target`, so submissions go on meanwhile.
+    fn finish_to(&self, target: u64) {
+        if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
+            return;
+        }
+        // SAFETY: the fence is ours; a null event blocks until it is reached.
+        unsafe {
+            if self.fence.GetCompletedValue() < target
+                && let Err(e) = self.fence.SetEventOnCompletion(target, HANDLE::default())
+            {
+                tracing::warn!(error = %e, "host fence wait failed");
+            }
+        }
+        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         self.reap_completed();
     }
 

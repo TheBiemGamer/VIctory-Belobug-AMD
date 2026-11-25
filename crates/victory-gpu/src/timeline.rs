@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 thread_local! {
@@ -49,12 +49,210 @@ pub(crate) enum Op {
     Work(Box<dyn FnOnce() + Send>),
 }
 
-#[derive(Default)]
 pub(crate) struct Timeline {
     state: Mutex<State>,
     /// Notified whenever `busy` clears so submitters waiting for another
     /// thread's in-progress step wake immediately.
     done: Condvar,
+    late: Late,
+}
+
+impl Default for Timeline {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            done: Condvar::new(),
+            late: Late {
+                signals: async_signal(),
+                waits: gpu_waits(),
+                owed: &HostWork,
+            },
+        }
+    }
+}
+
+/// What a queue leaves to the finishing thread ([`Finisher`]) instead of
+/// waiting for the host GPU on the thread that steps it.
+#[derive(Clone, Copy)]
+struct Late {
+    /// `VICTORY_ASYNC_SIGNAL`: its signals.
+    signals: bool,
+    /// `VICTORY_GPU_WAITS`: finishing the host work a wait may be owed by.
+    waits: bool,
+    owed: &'static dyn Owed,
+}
+
+/// Whether a queue's signals are given by the finishing thread once the
+/// host work before them is finished (`VICTORY_ASYNC_SIGNAL=1`), so the
+/// thread that submits them does not wait for the host GPU.
+fn async_signal() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SIGNAL").is_some_and(|v| v == "1"))
+}
+
+/// Whether a wait that unwaited host work may still owe holds its queue
+/// back while the finishing thread finishes that work
+/// (`VICTORY_GPU_WAITS=1`), instead of the submitting thread doing it.
+fn gpu_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_WAITS").is_some_and(|v| v == "1"))
+}
+
+/// Host GPU work still to finish.
+trait Owed: Sync {
+    /// The host fence value of the newest submission still to finish; 0
+    /// if none.
+    fn owed(&self) -> u64;
+    /// Waits until the host GPU reached `target`, then finishes what ran
+    /// up to it (puts back what it wrote, then its bottom-of-pipe writes).
+    fn finish(&self, target: u64);
+}
+
+struct HostWork;
+
+impl Owed for HostWork {
+    fn owed(&self) -> u64 {
+        #[cfg(windows)]
+        return crate::host::owed();
+        #[cfg(not(windows))]
+        0
+    }
+    fn finish(&self, target: u64) {
+        #[cfg(windows)]
+        crate::host::finish_to(target);
+        #[cfg(not(windows))]
+        let _ = target;
+    }
+}
+
+/// One thread finishes host work for the queues, in the order asked: one
+/// queue's signals are given in order, after what was submitted before.
+struct Finisher {
+    jobs: Mutex<Jobs>,
+    more: Condvar,
+}
+
+struct Jobs {
+    queue: VecDeque<Job>,
+    /// The job being done: what it finishes, up to which fence value.
+    running: Option<(&'static dyn Owed, u64)>,
+}
+
+struct Job {
+    owed: &'static dyn Owed,
+    target: u64,
+    signal: Option<(Held, u64)>,
+}
+
+impl Jobs {
+    fn idle(&self) -> bool {
+        self.queue.is_empty() && self.running.is_none()
+    }
+
+    /// Whether host work up to `target` is already being finished.
+    fn asked(&self, owed: &'static dyn Owed, target: u64) -> bool {
+        self.queue
+            .iter()
+            .map(|j| (j.owed, j.target))
+            .chain(self.running)
+            .any(|(o, t)| std::ptr::addr_eq(o, owed) && t >= target)
+    }
+}
+
+static FINISHER: Finisher = Finisher {
+    jobs: Mutex::new(Jobs {
+        queue: VecDeque::new(),
+        running: None,
+    }),
+    more: Condvar::new(),
+};
+
+impl Finisher {
+    fn jobs(&self) -> MutexGuard<'_, Jobs> {
+        self.jobs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the finishing thread runs (started on first use).
+    fn started(&'static self) -> bool {
+        static STARTED: OnceLock<bool> = OnceLock::new();
+        *STARTED.get_or_init(|| {
+            let started = std::thread::Builder::new()
+                .name("victory-finish".into())
+                .spawn(move || self.run());
+            if let Err(error) = &started {
+                tracing::warn!(%error, "no thread to finish host work; queues wait for it");
+            }
+            started.is_ok()
+        })
+    }
+
+    fn run(&self) {
+        loop {
+            let job = {
+                let mut jobs = self.jobs();
+                jobs.running = None;
+                loop {
+                    if let Some(job) = jobs.queue.pop_front() {
+                        jobs.running = Some((job.owed, job.target));
+                        break job;
+                    }
+                    jobs = self.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            job.owed.finish(job.target);
+            if let Some((fence, value)) = job.signal {
+                fence.signal(value);
+            }
+            progress();
+            crate::fence::wake();
+            kick();
+        }
+    }
+
+    /// Hands the thread host work to finish up to `target`, then `signal`;
+    /// the signal back if there is no thread.
+    fn push(
+        &'static self,
+        jobs: &mut Jobs,
+        owed: &'static dyn Owed,
+        target: u64,
+        signal: Option<(Held, u64)>,
+    ) -> Result<(), Option<(Held, u64)>> {
+        if !self.started() {
+            return Err(signal);
+        }
+        jobs.queue.push_back(Job {
+            owed,
+            target,
+            signal,
+        });
+        self.more.notify_one();
+        Ok(())
+    }
+}
+
+/// A queue's signal with `VICTORY_ASYNC_SIGNAL`: given at once if no host
+/// work is owed and no earlier signal waits to be given, else by the
+/// finishing thread once the owed work is finished.
+fn signal_late(owed: &'static dyn Owed, fence: Held, value: u64) {
+    let target = owed.owed();
+    let mut jobs = FINISHER.jobs();
+    // Given under the lock: a signal handed to the thread meanwhile must come after it.
+    if target == 0 && jobs.idle() {
+        fence.signal(value);
+        return;
+    }
+    let signal = Some((fence, value));
+    if let Err(Some((fence, value))) = FINISHER.push(&mut jobs, owed, target, signal) {
+        drop(jobs);
+        owed.finish(target);
+        fence.signal(value);
+    }
+}
+
+/// Whether the finishing thread has work left.
+fn finishing_late() -> bool {
+    !FINISHER.jobs().idle()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -122,12 +320,22 @@ pub(crate) fn held() -> bool {
 
 /// Whether any queue has work still to run.
 pub(crate) fn active() -> bool {
-    queues().iter().any(|q| !q.idle())
+    queues().iter().any(|q| !q.idle()) || finishing_late()
 }
 
 impl Timeline {
     pub(crate) fn new() -> Arc<Timeline> {
         let timeline = Arc::new(Timeline::default());
+        queues().push(timeline.clone());
+        timeline
+    }
+
+    #[cfg(test)]
+    fn with(late: Late) -> Arc<Timeline> {
+        let timeline = Arc::new(Timeline {
+            late,
+            ..Timeline::default()
+        });
         queues().push(timeline.clone());
         timeline
     }
@@ -178,6 +386,10 @@ impl Timeline {
                         // that one is finished first, then this is looked
                         // at again. Without this the queue stood until the
                         // wait was forced, two seconds a frame.
+                        if self.finish_late() {
+                            s.hold(true);
+                            return if moved { Step::Moved } else { Step::Idle };
+                        }
                         if !finishing() {
                             s.hold(true);
                             return if moved { Step::Moved } else { Step::Idle };
@@ -198,6 +410,10 @@ impl Timeline {
                             continue;
                         }
                         // As for a fence above.
+                        if self.finish_late() {
+                            s.hold(true);
+                            return if moved { Step::Moved } else { Step::Idle };
+                        }
                         if !finishing() {
                             s.hold(true);
                             return if moved { Step::Moved } else { Step::Idle };
@@ -212,6 +428,10 @@ impl Timeline {
                     }
                 }
                 Some(Op::Signal(..) | Op::Work(_)) => match s.ops.pop_front() {
+                    Some(Op::Signal(fence, value)) if self.late.signals => {
+                        let owed = self.late.owed;
+                        Box::new(move || signal_late(owed, fence, value))
+                    }
                     Some(Op::Signal(fence, value)) => Box::new(move || {
                         #[cfg(windows)]
                         crate::host::wait_in_flight_if_ready();
@@ -234,6 +454,21 @@ impl Timeline {
             progress();
             (moved, force) = (true, false);
         }
+    }
+
+    /// With `VICTORY_GPU_WAITS`: hands the finishing thread the host work
+    /// a wait not met may be owed by; whether it took it (or has it), and
+    /// the queue is to be held back until the work is finished.
+    fn finish_late(&self) -> bool {
+        if !self.late.waits {
+            return false;
+        }
+        let (owed, target) = (self.late.owed, self.late.owed.owed());
+        if target == 0 {
+            return false;
+        }
+        let mut jobs = FINISHER.jobs();
+        jobs.asked(owed, target) || FINISHER.push(&mut jobs, owed, target, None).is_ok()
     }
 }
 
@@ -321,10 +556,10 @@ fn watch() {
         .spawn(|| {
             loop {
                 if !held() {
-                    std::thread::sleep(Duration::from_millis(2));
+                    nap(Duration::from_millis(2));
                     continue;
                 }
-                std::thread::sleep(Duration::from_micros(500));
+                nap(Duration::from_micros(500));
                 pump_inner(false);
                 force();
             }
@@ -334,6 +569,24 @@ fn watch() {
     }
 }
 
+/// Set when the finishing thread finished work a held back queue may wait for.
+static KICK: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+/// Wakes the thread that looks at held back queues.
+fn kick() {
+    *KICK.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    KICK.1.notify_one();
+}
+
+/// Sleeps for `time`, or until kicked.
+fn nap(time: Duration) {
+    let mut kicked = KICK.0.lock().unwrap_or_else(|e| e.into_inner());
+    if !*kicked {
+        kicked = KICK.1.wait_timeout(kicked, time).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    *kicked = false;
+}
+
 /// Runs the op held back longest, if nothing moved for `LIMIT`.
 fn force() {
     let quiet = MOVED
@@ -341,7 +594,8 @@ fn force() {
         .unwrap_or_else(|e| e.into_inner())
         .is_none_or(|at| at.elapsed() > LIMIT);
     let all = queues().clone();
-    if !quiet || all.iter().any(|q| q.lock().busy) {
+    // Work the finishing thread still does is not a wait never met.
+    if !quiet || all.iter().any(|q| q.lock().busy) || finishing_late() {
         return;
     }
     let oldest = all
@@ -518,5 +772,146 @@ mod tests {
         })));
         assert!(nested.load(Ordering::Acquire));
         assert!(followup.load(Ordering::Acquire));
+    }
+
+    /// Host work the test runs by hand: `submit` owes a fence value,
+    /// `run` lets the GPU reach one.
+    #[derive(Default)]
+    struct FakeHost {
+        submitted: AtomicU64,
+        ran: Mutex<u64>,
+        ran_now: Condvar,
+        finished: AtomicU64,
+        /// A bottom-of-pipe write of the owed submission.
+        writes: Mutex<Option<(Held, u64)>>,
+    }
+
+    impl Owed for FakeHost {
+        fn owed(&self) -> u64 {
+            let submitted = self.submitted.load(Ordering::Acquire);
+            if submitted > self.finished.load(Ordering::Acquire) {
+                submitted
+            } else {
+                0
+            }
+        }
+        fn finish(&self, target: u64) {
+            let mut ran = self.ran.lock().unwrap();
+            while *ran < target {
+                ran = self.ran_now.wait(ran).unwrap();
+            }
+            drop(ran);
+            if self.finished.fetch_max(target, Ordering::AcqRel) < target
+                && let Some((fence, value)) = self.writes.lock().unwrap().take()
+            {
+                fence.signal(value);
+            }
+        }
+    }
+
+    impl FakeHost {
+        fn new() -> &'static FakeHost {
+            Box::leak(Box::default())
+        }
+        fn run(&self, to: u64) {
+            *self.ran.lock().unwrap() = to;
+            self.ran_now.notify_all();
+        }
+        fn late(&'static self, signals: bool, waits: bool) -> Late {
+            Late {
+                signals,
+                waits,
+                owed: self,
+            }
+        }
+    }
+
+    use crate::object::{S_OK, This, slot};
+
+    struct Fence(This);
+
+    impl Fence {
+        fn new() -> Fence {
+            let mut f = std::ptr::null();
+            let iid = &crate::fence::FENCE_IIDS[0];
+            assert_eq!(crate::fence::create(std::ptr::null(), 0, 0, iid, &mut f), S_OK);
+            Fence(f)
+        }
+        fn held(&self) -> Held {
+            Held::new(self.0)
+        }
+        fn value(&self) -> u64 {
+            slot::<extern "system" fn(This) -> u64>(self.0, 0x40)(self.0)
+        }
+    }
+
+    impl Drop for Fence {
+        fn drop(&mut self) {
+            slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+        }
+    }
+
+    /// `VICTORY_ASYNC_SIGNAL`: the signal returns at once, is given only
+    /// once the work before it is finished, after an earlier one; a wait
+    /// for it on another queue holds that queue back until then.
+    #[test]
+    fn late_signals_come_after_the_work_before_them_in_order() {
+        let host = FakeHost::new();
+        let (signals, waits) = (Timeline::with(host.late(true, false)), Timeline::new());
+        let fence = Fence::new();
+        host.submitted.store(1, Ordering::Release);
+        signals.submit(Op::Signal(fence.held(), 1));
+        // Owes nothing now, but must not overtake the signal before it.
+        host.finished.store(1, Ordering::Release);
+        host.submitted.store(1, Ordering::Release);
+        signals.submit(Op::Signal(fence.held(), 2));
+        assert_eq!(fence.value(), 0);
+        let seen = Arc::new(AtomicU64::new(0));
+        let see = seen.clone();
+        waits.submit(Op::Wait(fence.held(), 2));
+        waits.submit(Op::Work(Box::new(move || see.store(1, Ordering::Release))));
+        assert_eq!(seen.load(Ordering::Acquire), 0);
+        host.run(1);
+        until(|| seen.load(Ordering::Acquire) == 1);
+        assert_eq!(fence.value(), 2);
+        until(|| FINISHER.jobs().idle());
+    }
+
+    /// Without owed work and earlier signals, a late signal is given at once.
+    #[test]
+    fn late_signal_without_owed_work_is_given_at_once() {
+        let host = FakeHost::new();
+        let queue = Timeline::with(host.late(true, false));
+        let fence = Fence::new();
+        until(|| FINISHER.jobs().idle());
+        queue.submit(Op::Signal(fence.held(), 3));
+        assert_eq!(fence.value(), 3);
+    }
+
+    /// `VICTORY_GPU_WAITS`: a wait owed by unfinished host work holds the
+    /// queue back without the submission waiting for the host; what
+    /// follows runs once that work is finished and its writes are back.
+    #[test]
+    fn owed_wait_does_not_block_the_submission() {
+        let host = FakeHost::new();
+        let queue = Timeline::with(host.late(false, true));
+        let fence = Fence::new();
+        host.submitted.store(4, Ordering::Release);
+        *host.writes.lock().unwrap() = Some((fence.held(), 1));
+        let ran = Arc::new(AtomicBool::new(false));
+        let after_finish = Arc::new(AtomicBool::new(false));
+        let (r, a) = (ran.clone(), after_finish.clone());
+        let started = Instant::now();
+        queue.submit(Op::Wait(fence.held(), 1));
+        queue.submit(Op::Work(Box::new(move || {
+            a.store(host.finished.load(Ordering::Acquire) >= 4, Ordering::Release);
+            r.store(true, Ordering::Release);
+        })));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!ran.load(Ordering::Acquire));
+        host.run(4);
+        until(|| ran.load(Ordering::Acquire));
+        assert!(after_finish.load(Ordering::Acquire));
+        until(|| FINISHER.jobs().idle());
     }
 }
