@@ -25,6 +25,8 @@ mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod descriptor;
+#[cfg(windows)]
+mod detile;
 pub mod device;
 #[cfg(windows)]
 mod draw;

@@ -629,20 +629,10 @@ impl Layout {
         })
     }
 
-    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
-        &self,
-        tiled_len: usize,
-        mip: u32,
-        slice: u32,
-        linear_len: usize,
-        row_pitch: usize,
-        depth_pitch: usize,
-        mut copy: impl FnMut(usize, usize, usize),
-    ) -> Result<(), Error> {
+    /// The mip and first slice of subresource (`mip`, `slice`), if the
+    /// copies can address it.
+    fn subresource(&self, mip: u32, slice: u32) -> Result<(&Mip, u32), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
-        let depth = m.depth;
         let first = if self.desc.dimension == Dimension::Tex3d {
             if slice != 0 {
                 return Err(Error::Invalid);
@@ -657,6 +647,50 @@ impl Layout {
         if !self.addressable() {
             return Err(Error::Unsupported);
         }
+        Ok((m, first))
+    }
+
+    /// Tiled byte offsets of subresource (`mip`, `slice`) as
+    /// [`Layout::detile`] reads it: one per row (depth slice after depth
+    /// slice, from the texture's start) and one per element column (from
+    /// its row's), so element (x, y, z) starts at
+    /// `rows[z * height + y] + columns[x]`.
+    pub fn addresses(&self, mip: u32, slice: u32) -> Result<(Vec<u64>, Vec<u64>), Error> {
+        let (m, first) = self.subresource(mip, slice)?;
+        let n = u64::from(self.desc.element_bytes);
+        let linear = self.desc.swizzle == Swizzle::LINEAR;
+        let columns = (0..m.width)
+            .map(|x| if linear { u64::from(x) * n } else { self.column(m, x) })
+            .collect();
+        let mut rows = Vec::with_capacity(m.depth as usize * m.height as usize);
+        for z in 0..m.depth {
+            let (s, inner) = self.split(first + z);
+            let base = u64::from(s) * self.slice_size + m.offset;
+            rows.extend((0..m.height).map(|y| {
+                if linear {
+                    base + u64::from(y) * u64::from(m.pitch) * n
+                } else {
+                    base + self.row(m, y, inner)
+                }
+            }));
+        }
+        Ok((rows, columns))
+    }
+
+    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        &self,
+        tiled_len: usize,
+        mip: u32,
+        slice: u32,
+        linear_len: usize,
+        row_pitch: usize,
+        depth_pitch: usize,
+        mut copy: impl FnMut(usize, usize, usize),
+    ) -> Result<(), Error> {
+        let (m, first) = self.subresource(mip, slice)?;
+        let depth = m.depth;
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
         let slice_len = (m.height as usize - 1)
@@ -991,6 +1025,7 @@ mod tests {
                         .map(|i| (i * 7 + mip as usize * 13 + slice as usize) as u8)
                         .collect();
                     l.tile(&mut tiled, mip, slice, &linear, row, plane).unwrap();
+                    let (rows, columns) = l.addresses(mip, slice).unwrap();
                     let mut back = vec![0xcc; linear.len()];
                     l.detile(&tiled, mip, slice, &mut back, row, plane).unwrap();
                     for z in 0..m.depth {
@@ -1005,6 +1040,8 @@ mod tests {
                                 assert_eq!(tiled[at..at + n], linear[source..source + n]);
                                 assert!(at + n <= seen.len(), "{d:?} mip {mip} outside");
                                 assert!(at.is_multiple_of(n));
+                                let y_at = (z * m.height + y) as usize;
+                                assert_eq!(rows[y_at] + columns[x as usize], at as u64);
                                 assert!(!seen[at], "{d:?} mip {mip} ({x},{y},{z}) twice");
                                 seen[at] = true;
                             }

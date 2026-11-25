@@ -10,6 +10,9 @@
 //! which cannot be watched, a content hash of the whole memory at every
 //! submission that samples it.
 //!
+//! With `VICTORY_GPU_DETILE=1` ([`crate::detile`]) the memory is copied
+//! as it is and the host GPU detiles it, for the layouts it can address.
+//!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
@@ -57,6 +60,10 @@ pub(crate) struct Staging {
     /// Set once `GetWriteWatch` reports this texture is not in write-watched
     /// memory (physical-page views), skipping the syscall on every frame.
     not_watched: std::sync::atomic::AtomicBool,
+    /// Detiled on the GPU: `buffer` holds the tables and tiled bytes the
+    /// plan places, and `footprints` count from the start of the rows'
+    /// buffer the detiler writes.
+    gpu: Option<(Arc<crate::detile::Detiler>, crate::detile::Plan)>,
     #[cfg(test)]
     gpu_uploads: std::sync::atomic::AtomicU64,
 }
@@ -315,9 +322,15 @@ impl Staging {
                     return (0, false);
                 }
                 last.asked = now;
-                // Read through the copy, which stands unmapped pages: memory of
-                // big pools is too slow to ask page by page.
-                with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
+                if let Some((_, plan)) = &self.gpu {
+                    // SAFETY: the plan's room for `size` tiled bytes in the mapped upload buffer.
+                    let to = unsafe { self.data.add(plan.tiled_at as usize) };
+                    crate::host::copy_mapped(to, self.memory, size, false);
+                } else {
+                    // Read through the copy, which stands unmapped pages: memory of
+                    // big pools is too slow to ask page by page.
+                    with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
                 return (size, true);
@@ -408,6 +421,13 @@ impl Staging {
     /// Records `CopyTextureRegion` for every subresource from this staging
     /// buffer into `texture` (which must already be in `COPY_DEST`).
     pub(crate) fn record_copies(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
+        if let Some((detiler, plan)) = &self.gpu {
+            detiler.record(list, &self.buffer, plan, &self.footprints, texture);
+            #[cfg(test)]
+            self.gpu_uploads
+                .fetch_add(self.footprints.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         for (i, footprint) in self.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
@@ -447,6 +467,14 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
+        }
+        if let Some((_, plan)) = &self.gpu {
+            // SAFETY: the plan's room for the tiled bytes in the mapped upload buffer.
+            unsafe {
+                let to = self.data.add(plan.tiled_at as usize);
+                std::ptr::copy_nonoverlapping(tiled.as_ptr(), to, tiled.len());
+            }
+            return;
         }
         // The footprints' offsets count from the shared buffer's start (a slab
         // slot's offset added): the texture's bytes end `size` past the first.
@@ -653,14 +681,17 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return None;
     }
     let host = host()?;
-    let s = create_staging(host, Some(map), now, resource, texture, layout, memory)?;
+    let gpu = crate::detile::enabled();
+    let s = create_staging(host, Some(map), now, resource, texture, layout, memory, gpu)?;
     tracing::debug!(?desc, "texture contents queued for staging upload");
     map.insert(resource as usize, s.clone());
     Some(s)
 }
 
 /// A staging buffer for `texture`; with `map` (the kept ones), those no
-/// list holds are released first to stay within [`budget`].
+/// list holds are released first to stay within [`budget`]. With `gpu`,
+/// one the GPU detiles from, if it can.
+#[allow(clippy::too_many_arguments)]
 fn create_staging(
     host: &crate::host::Host,
     map: Option<&mut HashMap<usize, Arc<Staging>>>,
@@ -669,6 +700,7 @@ fn create_staging(
     texture: &ID3D12Resource,
     layout: victory_formats::texture::Layout,
     memory: *const u8,
+    gpu: bool,
 ) -> Option<Arc<Staging>> {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -693,13 +725,26 @@ fn create_staging(
             Some(&mut total),
         );
     }
+    let mips = u32::from(d.MipLevels);
+    let skip = crate::resource::skipped_mips(resource);
+    let mut planned = gpu.then(|| host.detiler()).flatten().and_then(|detiler| {
+        let tiled = layout.reach(skip);
+        let (tables, plan) = crate::detile::plan(&layout, tiled, mips, skip, &footprints, &rows)?;
+        detiler.reserve(host, plan.out).then_some((detiler, tables, plan))
+    });
+    let total = planned.as_ref().map_or(total, |(_, _, plan)| plan.upload);
     if let Some(map) = map {
         evict(map, total);
     }
     let (buffer, data, slot) = match crate::texpool::staging(host, total) {
         Some((buffer, data, offset, slot)) => {
-            for f in &mut footprints {
-                f.Offset += offset;
+            if let Some((_, _, plan)) = &mut planned {
+                plan.tables_at += offset;
+                plan.tiled_at += offset;
+            } else {
+                for f in &mut footprints {
+                    f.Offset += offset;
+                }
             }
             (buffer, data, Some(slot))
         }
@@ -708,6 +753,14 @@ fn create_staging(
             (buffer, data, None)
         }
     };
+    let gpu = planned.map(|(detiler, tables, plan)| {
+        // SAFETY: the plan's room for the tables in the mapped upload buffer.
+        unsafe {
+            let to = data.add(plan.tables_at as usize).cast::<u32>();
+            std::ptr::copy_nonoverlapping(tables.as_ptr(), to, tables.len());
+        }
+        (detiler, plan)
+    });
     STAGED.fetch_add(total, Ordering::Relaxed);
     crate::host::name(&buffer, || {
         format!(
@@ -724,12 +777,13 @@ fn create_staging(
         footprints,
         rows,
         layout,
-        mips: u32::from(d.MipLevels),
-        skip: crate::resource::skipped_mips(resource),
+        mips,
+        skip,
         memory,
         last: Mutex::default(),
         rewritten: Default::default(),
         not_watched: Default::default(),
+        gpu,
         #[cfg(test)]
         gpu_uploads: std::sync::atomic::AtomicU64::new(0),
     }))
@@ -747,6 +801,37 @@ mod tests {
     const SHADER_RESOURCE: u32 = (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0
         | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0) as u32;
 
+    fn make_texture(host: &Host, desc: &D3D12_RESOURCE_DESC) -> Arc<HostTexture> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut resource: Option<ID3D12Resource> = None;
+        // SAFETY: plain default-heap texture creation on our test device.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut resource,
+                )
+                .expect("create host texture");
+        }
+        Arc::new(HostTexture {
+            slot: None,
+            skip: 0,
+            written: Default::default(),
+            twin: Default::default(),
+            texture: resource.unwrap(),
+            flags: 0,
+            state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+            bytes: 0,
+        })
+    }
+
     fn make_rgba_texture(host: &Host, width: u32, height: u32) -> (Arc<HostTexture>, Texture) {
         let layout_tex = Texture::new(&TextureDesc {
             dimension: Dimension::Tex2d,
@@ -759,10 +844,6 @@ mod tests {
             swizzle: Swizzle::LINEAR,
         })
         .expect("linear RGBA layout");
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: u64::from(width),
@@ -777,30 +858,7 @@ mod tests {
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
             ..Default::default()
         };
-        let mut resource: Option<ID3D12Resource> = None;
-        // SAFETY: plain default-heap 2D texture creation on our test device.
-        unsafe {
-            host.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut resource,
-                )
-                .expect("create host texture");
-        }
-        let copy = Arc::new(HostTexture {
-            slot: None,
-            skip: 0,
-            written: Default::default(),
-            twin: Default::default(),
-            texture: resource.unwrap(),
-            flags: 0,
-            state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
-            bytes: 0,
-        });
+        let copy = make_texture(host, &desc);
         (copy, layout_tex)
     }
 
@@ -953,6 +1011,7 @@ mod tests {
             &copy.texture,
             layout.clone(),
             title_mem.as_ptr(),
+            false,
         )
         .expect("create staging");
         assert_eq!(staging.gpu_uploads(), 0);
@@ -1050,8 +1109,17 @@ mod tests {
             fill_linear_rgba(&layout, mem, v1);
         }
 
-        let staging = create_staging(&host, None, 0, std::ptr::null(), &copy.texture, layout.clone(), raw)
-            .expect("create staging");
+        let staging = create_staging(
+            &host,
+            None,
+            0,
+            std::ptr::null(),
+            &copy.texture,
+            layout.clone(),
+            raw,
+            false,
+        )
+        .expect("create staging");
 
         let run_once = || {
             let list = host.new_list().expect("new list");
@@ -1093,6 +1161,280 @@ mod tests {
 
         // SAFETY: freeing our own allocation.
         unsafe { VirtualFree(raw.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// Every subresource of `texture` (in `state`), as `GetCopyableFootprints` lays them out.
+    fn read_back_all(host: &Host, texture: &ID3D12Resource, state: u32) -> Vec<u8> {
+        // SAFETY: a live texture.
+        let desc = unsafe { texture.GetDesc() };
+        let count = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            u32::from(desc.MipLevels)
+        } else {
+            u32::from(desc.MipLevels) * u32::from(desc.DepthOrArraySize)
+        };
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+        let mut total = 0u64;
+        // SAFETY: outputs for `count` subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &desc,
+                0,
+                count,
+                0,
+                Some(footprints.as_mut_ptr()),
+                None,
+                None,
+                Some(&mut total),
+            );
+        }
+        let (readback, data) = host.readback_buffer(total).expect("readback buffer");
+        let list = host.new_list().expect("readback list");
+        let state = D3D12_RESOURCE_STATES(state as i32);
+        // SAFETY: an open list; the texture and buffer are live.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                texture,
+                state,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            for (i, footprint) in footprints.iter().enumerate() {
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: *footprint,
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: i as u32,
+                    },
+                };
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+            list.list.ResourceBarrier(&[crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                state,
+            )]);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the GPU finished writing the mapped readback buffer.
+        unsafe { std::slice::from_raw_parts(data, total as usize) }.to_vec()
+    }
+
+    /// The same tiled memory detiled on the CPU and on the GPU gives the
+    /// same texture, byte for byte: element sizes 1 to 16, block
+    /// compression, mip tails, array slices, a 3D texture, linear, watched
+    /// and unwatched memory, and a second upload after the memory changed.
+    #[test]
+    fn gpu_detiling_matches_the_cpu() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(host) = Host::new_hardware_or_warp() else {
+            return;
+        };
+        let cases = [
+            // (DXGI format, dimension, width, height, depth or array, mips, swizzle)
+            (61, Dimension::Tex2d, 33, 17, 1, 6, Swizzle::SW_4KB_D),
+            (56, Dimension::Tex2d, 40, 9, 1, 3, Swizzle::SW_64KB_S),
+            (28, Dimension::Tex2d, 100, 60, 1, 7, Swizzle::SW_64KB_D),
+            (11, Dimension::Tex2d, 250, 175, 1, 8, Swizzle::SW_4KB_S),
+            (3, Dimension::Tex2d, 64, 64, 1, 7, Swizzle::SW_64KB_D),
+            (98, Dimension::Tex2d, 256, 256, 1, 9, Swizzle::SW_64KB_D),
+            (71, Dimension::Tex2d, 108, 72, 1, 7, Swizzle::SW_256B_D),
+            (98, Dimension::Tex2d, 64, 64, 3, 7, Swizzle::SW_4KB_S),
+            (28, Dimension::Tex2d, 30, 20, 2, 5, Swizzle::LINEAR),
+            (61, Dimension::Tex2d, 83, 31, 1, 6, Swizzle::SW_256B_S),
+            (28, Dimension::Tex3d, 64, 32, 16, 7, Swizzle::SW_4KB_S),
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut fill = |memory: &mut [u8]| {
+            for b in memory {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *b = (seed >> 24) as u8;
+            }
+        };
+        for (i, &(format, dimension, width, height, depth, mips, swizzle)) in
+            cases.iter().enumerate()
+        {
+            let tex = Texture::new(&TextureDesc {
+                dimension,
+                format,
+                width,
+                height,
+                depth_or_array: depth,
+                mips,
+                samples: 1,
+                swizzle,
+            })
+            .expect("layout");
+            let layout = tex.planes[0].layout.clone();
+            let size = layout.size as usize;
+            let watched = i % 2 == 0;
+            let room = size.next_multiple_of(crate::watch::PAGE);
+            let mut memories = [(); 2].map(|()| {
+                let watch = if watched { MEM_WRITE_WATCH } else { 0 };
+                // SAFETY: a private allocation, freed below.
+                let at = unsafe {
+                    let kind = MEM_RESERVE | MEM_COMMIT | watch;
+                    VirtualAlloc(std::ptr::null(), room, kind, PAGE_READWRITE)
+                };
+                assert!(!at.is_null());
+                // SAFETY: `room` committed read-write bytes, ours alone.
+                unsafe { std::slice::from_raw_parts_mut(at.cast::<u8>(), size) }
+            });
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: if dimension == Dimension::Tex3d {
+                    D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                } else {
+                    D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                },
+                Width: u64::from(width),
+                Height: height,
+                DepthOrArraySize: depth as u16,
+                MipLevels: mips as u16,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            let copies = [(); 2].map(|()| make_texture(&host, &desc));
+            let stagings: Vec<_> = (0..2)
+                .map(|k| {
+                    create_staging(
+                        &host,
+                        None,
+                        0,
+                        std::ptr::null(),
+                        &copies[k].texture,
+                        layout.clone(),
+                        memories[k].as_ptr(),
+                        k == 1,
+                    )
+                    .expect("staging")
+                })
+                .collect();
+            assert!(stagings[0].gpu.is_none());
+            assert!(stagings[1].gpu.is_some(), "case {i} not detiled on the GPU");
+            for round in 0..2 {
+                fill(memories[0]);
+                let (cpu, gpu) = memories.split_at_mut(1);
+                gpu[0].copy_from_slice(cpu[0]);
+                let list = host.new_list().expect("new list");
+                for k in 0..2 {
+                    list.defer_texture(stagings[k].clone(), copies[k].clone());
+                    list.expect_texture_state(&copies[k], SHADER_RESOURCE);
+                }
+                list.close();
+                host.execute(&[&list]);
+                let [cpu, gpu] =
+                    [0, 1].map(|k| read_back_all(&host, &copies[k].texture, SHADER_RESOURCE));
+                assert!(cpu.iter().any(|&b| b != 0), "case {i}: nothing detiled");
+                assert!(cpu == gpu, "case {i} round {round}: GPU detiling differs from the CPU's");
+            }
+            assert_eq!(stagings[1].gpu_uploads(), 2 * stagings[1].footprints.len() as u64);
+            for memory in memories {
+                // SAFETY: our own allocation, which the stagings no longer read.
+                unsafe { VirtualFree(memory.as_mut_ptr().cast(), 0, MEM_RELEASE) };
+            }
+        }
+    }
+
+    /// CPU time of a changed texture's refresh, detiled on the CPU and for
+    /// the GPU. Run with
+    /// `cargo test --release -p victory-gpu detiling_cpu_time -- --ignored --nocapture
+    /// --test-threads=1`.
+    #[test]
+    #[ignore = "release benchmark"]
+    fn detiling_cpu_time() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(host) = Host::new_hardware_or_warp() else {
+            return;
+        };
+        for (format, side, name) in [(98, 2048, "BC7"), (28, 2048, "RGBA8"), (28, 4096, "RGBA8")] {
+            let tex = Texture::new(&TextureDesc {
+                dimension: Dimension::Tex2d,
+                format,
+                width: side,
+                height: side,
+                depth_or_array: 1,
+                mips: 0,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_D,
+            })
+            .expect("layout");
+            let layout = tex.planes[0].layout.clone();
+            let size = layout.size as usize;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: u64::from(side),
+                Height: side,
+                DepthOrArraySize: 1,
+                MipLevels: layout.mips.len() as u16,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            // SAFETY: a private write-watched allocation, freed below.
+            let memory = unsafe {
+                let kind = MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH;
+                VirtualAlloc(std::ptr::null(), size, kind, PAGE_READWRITE)
+            }
+            .cast::<u8>();
+            assert!(!memory.is_null());
+            // SAFETY: `size` committed bytes, ours alone.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(memory, size) };
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (i * 7 + i / 4093) as u8;
+            }
+            let copy = make_texture(&host, &desc);
+            for gpu in [false, true] {
+                let staging = create_staging(
+                    &host,
+                    None,
+                    0,
+                    std::ptr::null(),
+                    &copy.texture,
+                    layout.clone(),
+                    memory,
+                    gpu,
+                )
+                .expect("staging");
+                let mut took = Vec::new();
+                for round in 0..20u8 {
+                    // SAFETY: the allocation's first byte; a write dirties its page.
+                    unsafe { memory.write_volatile(round) };
+                    let started = std::time::Instant::now();
+                    assert!(staging.refresh());
+                    took.push(started.elapsed().as_secs_f64() * 1e3);
+                }
+                took.sort_by(f64::total_cmp);
+                println!(
+                    "{name} {side}x{side} ({} MiB) on the {}: median {:.2} ms",
+                    size >> 20,
+                    if gpu { "GPU" } else { "CPU" },
+                    took[took.len() / 2]
+                );
+            }
+            // SAFETY: our own allocation.
+            unsafe { VirtualFree(memory.cast(), 0, MEM_RELEASE) };
+        }
     }
 
     #[test]
