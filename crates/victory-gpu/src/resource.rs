@@ -227,12 +227,17 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 }
 
 /// A format as the host has it. The console's 16-bit depth with stencil
-/// (and its typeless views) has no PC format: the 24-bit ones stand in.
+/// (and its typeless views) has no PC format: the 32-bit float ones stand
+/// in, so the depth its shaders write as images (`crate::twin`) is the very
+/// float a draw rasterises (in 24-bit depth, which AMD keeps as floats, a
+/// draw at the title's depths passed EQUAL for one material of 4096).
+/// shortcut: a depth bias on such a target counts in float steps, about 2^17
+/// times weaker than 1/65535 at these depths; scale it if biased draws show acne.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
-        118 => 45,
-        119 => 46,
-        120 => 47,
+        118 => 20,
+        119 => 21,
+        120 => 22,
         other => other,
     }
 }
@@ -2817,8 +2822,8 @@ mod tests {
             },
         );
 
-        // 5) Console formats 118..=120 (3 B/texel) map to 4-byte PC formats
-        // (45..=47): skipped cleanly without breaking Close() or touching dst.
+        // 5) Console formats 118..=120 (3 B/texel) map to 8-byte PC formats
+        // (20..=22): skipped cleanly without breaking Close() or touching dst.
         let mut dst_d16s8 = null;
         assert_eq!(
             create_committed(null, &PROPERTIES, 0, &buffer(1024), 0, null.cast(), iid, &mut dst_d16s8),

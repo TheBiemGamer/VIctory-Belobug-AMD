@@ -831,7 +831,7 @@ extern "system" fn copy_texture_region(
                 != crate::resource::element(dst.footprint.format)
             {
                 // Console formats such as 118..=120 (3-byte D16S8) map to
-                // 4-byte PC substitutes (45..=47): raw readback would mis-size
+                // 8-byte PC substitutes (20..=22): raw readback would mis-size
                 // the staging buffer and write the wrong texel layout.
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {

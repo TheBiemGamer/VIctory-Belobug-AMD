@@ -88,7 +88,7 @@ pub(crate) fn make(texture: &ID3D12Resource) -> Option<Twin> {
         .find(|&&(typed, typeless)| typed == own || typeless == own)
         .map(|&(typed, _)| typed)?;
     // D24S8 and D32S8 have stencil (the console's 16-bit depth with stencil
-    // becomes D24S8 on the host).
+    // becomes D32S8 on the host).
     let has_stencil = matches!(typed, 20 | 45);
     let plane = |format: DXGI_FORMAT| -> Option<ID3D12Resource> {
         let desc = D3D12_RESOURCE_DESC {
@@ -260,17 +260,24 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 }
+// The title's 16-bit depth n as the float its draws rasterise and test EQUAL:
+// n times its 1/65535 (0x37800080), which differs from the correctly rounded
+// n / 65535 an R16_UNORM load gives by an ulp for 512 values.
+float depth(float4 at) {
+    uint n = (uint)(depth_.Load(int3(at.xy, 0)) * 65535.0 + 0.5);
+    return (float)n * asfloat(0x37800080);
+}
 struct Both { float depth : SV_Depth; uint stencil : SV_StencilRef; };
 [RootSignature(RS)]
 Both both(float4 at : SV_Position) {
     Both o;
-    o.depth = depth_.Load(int3(at.xy, 0));
+    o.depth = depth(at);
     o.stencil = stencil_.Load(int3(at.xy, 0));
     return o;
 }
 [RootSignature(RS)]
 float depth_only(float4 at : SV_Position) : SV_Depth {
-    return depth_.Load(int3(at.xy, 0));
+    return depth(at);
 }
 [RootSignature(RS)]
 uint stencil_only(float4 at : SV_Position) : SV_StencilRef {
