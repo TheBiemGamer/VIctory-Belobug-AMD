@@ -230,10 +230,18 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+                  [--host-lanes MIN-MAX]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
 ```
+
+`translate --host-lanes MIN-MAX` selects the host wave-size range used by the
+shader translator, for example `32-32` for NVIDIA or `32-64` for AMD RDNA.
+A single size such as `64` is also accepted. Without this option, translation
+accepts any host wave size unless `--pipelines` selects the current GPU's
+range. An explicit `--host-lanes` overrides that detected range. See
+[docs/wave64-on-wave32.md](docs/wave64-on-wave32.md) for the remaining limits.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
@@ -254,14 +262,15 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_CAPTURE=<dir>` | saves presented frames at powers of two and at frame numbers listed in `VICTORY_CAPTURE_FRAMES` |
+| `VICTORY_CAPTURE_FRAMES=<n>,...` | with `VICTORY_CAPTURE`, also saves these comma-separated frame numbers |
+| `VICTORY_DUMP_TARGETS=1` | with `VICTORY_CAPTURE` and `VICTORY_CAPTURE_FRAMES`, saves render targets of the listed frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms (0 does not wait). A draw can be omitted until its pipeline is ready |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_GPU_TIMING=1` | runs and times each list of a submission on its own; add `VICTORY_D3D12_DRED=1` to include recorded commands in slow-list logs |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
