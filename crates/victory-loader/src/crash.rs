@@ -92,7 +92,8 @@ fn append_to_file(file: &std::path::Path, text: &str) {
         .map_or(0, |d| d.as_secs());
     let entry = format!("unix time {now}, process {}\n{text}\n", std::process::id());
     // Not a plain lock: a crash on the thread holding it (while it reports
-    // another) would hang here; after ~100 ms it writes without the lock.
+    // another) would hang here; after 100 short waits (up to ~1.5 s at the
+    // default timer tick) it writes without the lock.
     let mut guard = None;
     for _ in 0..100 {
         match LOG_LOCK.try_lock() {
