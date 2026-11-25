@@ -432,9 +432,15 @@ pub extern "system" fn MFCreateSourceResolver(out: *mut *mut Resolver) -> HRESUL
         return E_POINTER;
     }
     static CREATE: OnceLock<Option<usize>> = OnceLock::new();
-    let Some(create) =
-        *CREATE.get_or_init(|| crate::host::function("mfplat.dll", "MFCreateSourceResolver"))
-    else {
+    // Resolved outside the OnceLock, as `files::host!`.
+    let resolved = match CREATE.get() {
+        Some(&c) => c,
+        None => {
+            let c = crate::host::function("mfplat.dll", "MFCreateSourceResolver");
+            *CREATE.get_or_init(|| c)
+        }
+    };
+    let Some(create) = resolved else {
         return UNSUPPORTED_SCHEME;
     };
     // SAFETY: the host's `MFCreateSourceResolver(IMFSourceResolver**)`.

@@ -25,10 +25,16 @@ use crate::{HleExport, HleModule, hle_export};
 macro_rules! host {
     ($dll:literal, $name:literal: $ty:ty) => {{
         static ADDRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let address = *ADDRESS.get_or_init(|| {
-            crate::host::function($dll, $name)
-                .unwrap_or_else(|| panic!("the host lacks {}!{}", $dll, $name))
-        });
+        // Resolved outside the OnceLock: a first load takes the OS loader lock,
+        // under which title code may call here (as `host::module`).
+        let address = match ADDRESS.get() {
+            Some(&a) => a,
+            None => {
+                let a = crate::host::function($dll, $name)
+                    .unwrap_or_else(|| panic!("the host lacks {}!{}", $dll, $name));
+                *ADDRESS.get_or_init(|| a)
+            }
+        };
         // SAFETY: the host exports this function with this signature.
         unsafe { std::mem::transmute::<usize, $ty>(address) }
     }};
