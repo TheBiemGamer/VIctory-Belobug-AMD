@@ -2032,9 +2032,10 @@ impl Shadow {
         crate::host::in_parallel(&work, 8, |chunk| {
             let mut title: Option<Vec<u8>> = None;
             for &(at, data, n, old) in chunk {
-                // SAFETY: the tile's mapping and its snapshot (kept under the
-                // lock held above); this tile is this thread's alone.
+                // SAFETY: the tile's mapping; this tile is this thread's alone.
                 let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
+                // SAFETY: the tile's snapshot, kept under the lock held above
+                // (nothing is inserted meanwhile); this thread's alone.
                 let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
                 #[cfg(feature = "diagnostics")]
                 SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
