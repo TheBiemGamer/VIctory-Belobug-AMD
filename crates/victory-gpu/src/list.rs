@@ -500,14 +500,13 @@ pub(crate) struct Barrier {
 /// `id=523` (Missing resource bind flags) and makes `Close()` return
 /// `E_INVALIDARG`.
 #[cfg(windows)]
-fn uav_barrier_for(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> Barrier {
+fn uav_barrier_for(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    flags: u32,
+) -> Barrier {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     use windows::core::Interface;
-    // SAFETY: a plain query on a live host resource.
-    let allows_uav = unsafe { texture.GetDesc() }.Flags.0
-        & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0
-        != 0;
-    if allows_uav {
+    if flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32 != 0 {
         Barrier {
             kind: 2,
             flags: 0,
@@ -536,12 +535,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
-            let (texture, before) = list.transition(b.first, wanted)?;
-            let before = crate::host::legal_state(texture, before);
-            let after = crate::host::legal_state(texture, wanted);
-            if before == after {
-                return None;
-            }
+            let (texture, before, after) = list.transition(b.first, wanted)?;
             Some(Barrier {
                 kind: 0,
                 flags: 0,
@@ -567,7 +561,8 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             if b.first.is_null() {
                 Some(UAV_BARRIER)
             } else {
-                Some(uav_barrier_for(crate::resource::host_resource(b.first)?))
+                let copy = crate::resource::host_texture_of(b.first)?;
+                Some(uav_barrier_for(&copy.texture, copy.flags))
             }
         }
         _ => None,
@@ -628,8 +623,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if !resource.is_null() {
         crate::resource::note_written(resource, state);
     }
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
+    if let Some((texture, before, state)) = list.transition(resource, state) {
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
@@ -2248,13 +2242,15 @@ mod tests {
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         );
-        let b_depth = uav_barrier_for(&depth);
+        // SAFETY: plain queries on live resources.
+        let flags = |t: &ID3D12Resource| unsafe { t.GetDesc() }.Flags.0 as u32;
+        let b_depth = uav_barrier_for(&depth, flags(&depth));
         assert_eq!(b_depth.kind, 2);
         assert!(
             b_depth.first.is_null(),
             "depth texture must fall back to global UAV barrier"
         );
-        let b_uav = uav_barrier_for(&uav_tex);
+        let b_uav = uav_barrier_for(&uav_tex, flags(&uav_tex));
         assert_eq!(b_uav.kind, 2);
         assert!(!b_uav.first.is_null(), "UAV texture keeps its resource pointer");
         // Verify both barriers record and close cleanly on a live host command list.
