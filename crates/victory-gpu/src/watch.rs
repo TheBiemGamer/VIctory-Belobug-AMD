@@ -235,6 +235,14 @@ impl Guards {
     fn pinned(&self, block: usize) -> bool {
         self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
     }
+
+    /// Forgets the pins that ended.
+    fn unpin_ended(&mut self) {
+        if !self.pins.is_empty() {
+            let now = std::time::Instant::now();
+            self.pins.retain(|&(_, _, until)| until > now);
+        }
+    }
 }
 
 /// Views of one page past which its views are not guarded together (the
@@ -360,12 +368,17 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     {
         let mut g = guards();
         if g.protected.contains(&first) || g.holes.contains(&first) {
+            g.unpin_ended();
             let mut written = Vec::new();
             let mut run: Option<usize> = None;
             for block in first..=last {
                 let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
                 if open {
-                    if g.protected.contains(&block) {
+                    if g.pinned(block) {
+                        // As on the slow path: left writable, reported written.
+                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                        bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
+                    } else if g.protected.contains(&block) {
                         g.clean.insert(block);
                         written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                     } else {
@@ -391,10 +404,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let check_each = probe != start;
     install();
     let mut g = guards();
-    if !g.pins.is_empty() {
-        let now = std::time::Instant::now();
-        g.pins.retain(|&(_, _, until)| until > now);
-    }
+    g.unpin_ended();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     for block in first..=last {
@@ -1058,5 +1068,62 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// A block the kernel is about to write stays writable at a check that
+    /// starts at a guarded block, and every check reports it written.
+    #[test]
+    fn a_pinned_block_is_left_writable_by_a_check_from_a_guarded_one() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let pages = |block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some(vec![pages(0), pages(1)])
+        );
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"from the disk").unwrap();
+        // The second block only: the first stays guarded, so the checks below
+        // take the path for a range that starts at a guarded block.
+        writing(view + BLOCK + 100, 13);
+        for _ in 0..2 {
+            assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![pages(1)]));
+            file.rewind().unwrap();
+            // SAFETY: 13 bytes of our view, nothing else refers to them.
+            let into =
+                unsafe { std::slice::from_raw_parts_mut((view + BLOCK + 100) as *mut u8, 13) };
+            assert!(
+                file.read(into).is_ok_and(|n| n == 13),
+                "the kernel can still write it"
+            );
+        }
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            })
+        };
+        title_memory_remapped(view, 2 * BLOCK);
+        // So that a view another test maps here is not left writable by it.
+        guards()
+            .pins
+            .retain(|&(from, to, _)| to <= view / BLOCK || from >= view / BLOCK + 2);
     }
 }
