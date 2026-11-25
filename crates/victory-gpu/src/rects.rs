@@ -15,12 +15,11 @@
 //! a buffer the list keeps), and vertex strides, element offsets and the
 //! buffer's address must be multiples of 4 bytes; other draws are dropped.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
 use crate::host::{Host, HostList, host, transition};
+use crate::indirect::{Clamp, compile, uav_barrier};
 
 /// Elements one expansion handles.
 pub(crate) const ELEMENTS: usize = 12;
@@ -120,18 +119,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-struct Expand {
-    root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
-}
-
-// SAFETY: D3D12 objects are free-threaded.
-unsafe impl Send for Expand {}
-// SAFETY: as above.
-unsafe impl Sync for Expand {}
-
-fn expand() -> Option<&'static Expand> {
-    static EXPAND: std::sync::OnceLock<Option<Expand>> = std::sync::OnceLock::new();
+fn expand() -> Option<&'static Clamp> {
+    static EXPAND: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     EXPAND
         .get_or_init(|| match make() {
             Ok(c) => Some(c),
@@ -143,68 +132,14 @@ fn expand() -> Option<&'static Expand> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Expand> {
+fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("rects"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
-            };
-            tracing::warn!("rectangle expansion: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
-        })?;
-        Ok(Expand { root, pso })
-    }
-}
-
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
-            }),
-        },
-    }
+    compile(device, SOURCE, s!("rects"), "rectangle expansion")
 }
 
 /// Runs the shader in `mode` over `count` items, reading host address
 /// `from` and writing `to`.
-fn run(list: &HostList, e: &Expand, constants: &[u32; 16], from: u64, to: u64, count: u32) {
+fn run(list: &HostList, e: &Clamp, constants: &[u32; 16], from: u64, to: u64, count: u32) {
     let l = &list.list;
     // SAFETY: an open list; our root signature and pipeline; the addresses
     // name live buffers the list keeps.

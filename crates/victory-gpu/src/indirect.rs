@@ -23,7 +23,7 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{PCSTR, s};
 
 use crate::host::{HostList, host, transition};
 
@@ -117,9 +117,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-struct Clamp {
-    root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
+/// A compute shader's root signature and pipeline: the clamp's, and what
+/// [`compile`] makes for the other shaders of ours.
+pub(crate) struct Clamp {
+    pub(crate) root: ID3D12RootSignature,
+    pub(crate) pso: ID3D12PipelineState,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -146,14 +148,26 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    compile(device, SOURCE, s!("clamp"), "argument clamp")
+}
+
+/// Compiles the compute shader `source` (its root signature inside it) as
+/// `name` and builds its pipeline; the compiler's messages are logged under
+/// `what`.
+pub(crate) fn compile(
+    device: &ID3D12Device,
+    source: &str,
+    name: PCSTR,
+    what: &str,
+) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
+            source.as_ptr().cast(),
+            source.len(),
+            name,
             None,
             None,
             s!("main"),
@@ -173,7 +187,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
                     errors.GetBufferSize(),
                 )
             };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+            tracing::warn!("{what}: {}", String::from_utf8_lossy(text));
         }
         return Err(e);
     }
@@ -455,7 +469,7 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -529,7 +543,8 @@ void main() {
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
                 let clamp = make_for(&device).expect("clamp shader must compile on WARP");
-                let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
+                let worker = compile(&device, WORKER_CS, s!("worker"), "worker")
+                    .expect("worker shader must compile");
                 Some(Self {
                     device,
                     queue,
@@ -660,41 +675,6 @@ void main() {
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();
             }
-        }
-    }
-
-    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            })?;
-            Ok(Clamp { root, pso })
         }
     }
 
