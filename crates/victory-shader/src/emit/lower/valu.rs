@@ -4,7 +4,7 @@ use super::{LANE_MASK, Lower, MaskData, Val, Why, inline_f16};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::ir::{EXEC, Inst, Reg};
+use crate::ir::{EXEC, Inst, Program, Reg};
 
 impl Lower<'_> {
     pub(super) fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -796,9 +796,7 @@ impl Lower<'_> {
                     Some(Ok(o)) => o,
                     _ => self.s.m.i32(0),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = self.narrow16(r);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -1515,8 +1513,7 @@ impl Lower<'_> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            let h =
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+            let h = l.narrow16(f);
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -1831,7 +1828,7 @@ impl Lower<'_> {
             return Err("a packed half FMA of constants");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let old = inst.read(Reg::V(reg)).ok_or("an unread destination")?;
         let words = [self.operand(inst, &v.src[0])?, self.operand(inst, &v.src[1])?, self.i32_of(old)?];
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
@@ -1846,7 +1843,7 @@ impl Lower<'_> {
                 })
                 .collect();
             let f = self.fmad(xs[0], xs[1], xs[2]);
-            halves.push(self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]));
+            halves.push(self.narrow16(f));
         }
         let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
         let lo = self.s.m.bin(c, Bin::And, halves[0], low);
@@ -1870,7 +1867,7 @@ impl Lower<'_> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -1902,8 +1899,7 @@ impl Lower<'_> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                self.narrow16(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
@@ -2799,6 +2795,385 @@ impl Lower<'_> {
             self.vals
                 .entry(w)
                 .or_insert(Val::Missing("a lane mask read as data"));
+        }
+    }
+}
+
+/// MODE's 16/64-bit round mode (bits 3:2; 0 nearest even, 3 toward zero)
+/// after `inst`, from `mode` before it; `None` where not known.
+pub(super) fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
+    match (inst.name(), &inst.fields) {
+        ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
+        (
+            "s_setreg_imm32_b32" | "s_setreg_b32",
+            Fields::Sop {
+                src, imm: Some(h), ..
+            },
+        ) => {
+            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
+            if id != 1 || off >= 4 || off + size <= 2 {
+                return mode;
+            }
+            match src.first() {
+                Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
+                    Some((x >> (2 - off) & 3) as u8)
+                }
+                _ => None,
+            }
+        }
+        _ => mode,
+    }
+}
+
+/// The round mode each block starts with: nearest even at the program's
+/// start; `None` where paths that set it differently join.
+pub(super) fn round16(p: &Program) -> Vec<Option<u8>> {
+    // Outer None: block not reached yet.
+    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
+    entry[0] = Some(Some(0));
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    loop {
+        let mut changed = false;
+        for &b in &order {
+            let Some(mut m) = entry[b] else { continue };
+            for inst in &p.blocks[b].insts {
+                m = round16_after(inst, m);
+            }
+            for s in p.blocks[b].exit.successors() {
+                let new = match entry[s] {
+                    None => Some(m),
+                    Some(old) if old == m => continue,
+                    Some(_) => Some(None),
+                };
+                if entry[s] != new {
+                    entry[s] = new;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return entry.into_iter().map(Option::flatten).collect();
+        }
+    }
+}
+
+impl Lower<'_> {
+    /// A 32-bit denormal as a zero of its sign, as the console's float mode
+    /// reads it; decided on the bits since the host's denormal mode varies.
+    fn ftz(&mut self, f: V) -> V {
+        let c = self.cur;
+        let x = self.as_int(f);
+        let (exp, sign, zero) = (
+            self.s.m.i32(0x7F80_0000),
+            self.s.m.i32(0x8000_0000),
+            self.s.m.i32(0),
+        );
+        let e = self.s.m.bin(c, Bin::And, x, exp);
+        let den = self.s.m.cmp(c, pred::EQ, e, zero);
+        let s = self.s.m.bin(c, Bin::And, x, sign);
+        let r = self.s.m.select(c, den, s, x);
+        self.as_float(r)
+    }
+
+    /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
+    /// FMax/FMin, but of the operands with denormals read as zeros and with
+    /// -0 ordered below +0 (RDNA2 ISA, `v_max_f32`), where the compare and
+    /// select DXIL specifies gives either zero.
+    fn max_min(&mut self, max: bool, a: V, b: V) -> V {
+        let (a, b) = (self.ftz(a), self.ftz(b));
+        self.max_min_flushed(max, a, b)
+    }
+
+    /// [`Self::max_min`] of operands without denormals.
+    fn max_min_flushed(&mut self, max: bool, a: V, b: V) -> V {
+        let c = self.cur;
+        let r = self.binary(if max { 35 } else { 36 }, a, b);
+        let (ia, ib) = (self.as_int(a), self.as_int(b));
+        let either = self.s.m.bin(c, Bin::Or, ia, ib);
+        let magnitude = self.s.m.i32(0x7FFF_FFFF);
+        let either = self.s.m.bin(c, Bin::And, either, magnitude);
+        let zero = self.s.m.i32(0);
+        let zeros = self.s.m.cmp(c, pred::EQ, either, zero);
+        // Of two zeros, +0 unless both are -0 (max), -0 unless neither (min).
+        let op = if max { Bin::And } else { Bin::Or };
+        let sign = self.s.m.bin(c, op, ia, ib);
+        let signed = self.as_float(sign);
+        self.s.m.select(c, zeros, signed, r)
+    }
+
+    /// The median of three. With a NaN among them the hardware gives the
+    /// minimum of the three instead (the host's minimum skips NaNs, so that
+    /// is the smallest number among them).
+    ///
+    /// Uses `dx.op.isSpecialFloat.f32` (`IsNaN`) instead of `fcmp uno`: some
+    /// D3D12 drivers (observed on Intel Iris Xe) fold `fcmp uno x, x` to false
+    /// under default shader fast-math, returning the wrong operand when the
+    /// third input is NaN.
+    fn med3(&mut self, a: V, b: V, third: V) -> V {
+        let c = self.cur;
+        let (a, b, third) = (self.ftz(a), self.ftz(b), self.ftz(third));
+        let lo = self.max_min_flushed(false, a, b);
+        let hi = self.max_min_flushed(true, a, b);
+        let t = self.max_min_flushed(false, hi, third);
+        let median = self.max_min_flushed(true, lo, t);
+        let least = self.max_min_flushed(false, lo, third);
+        let is_nan = |l: &mut Self, x: V| {
+            l.s.op(c, "isSpecialFloat.f32", Attr::ReadNone, l.s.t.i1, 8, &[x])
+        };
+        let nan_a = is_nan(self, a);
+        let nan_b = is_nan(self, b);
+        let nan_c = is_nan(self, third);
+        let ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
+        let nan = self.s.m.bin(c, Bin::Or, ab, nan_c);
+        self.s.m.select(c, nan, least, median)
+    }
+
+    /// `f` as an f16 in the low bits, rounded on the bits as MODE says here:
+    /// DXIL's `legacyF32ToF16` rounds as the host likes (toward zero on RDNA2-4 and WARP).
+    // shortcut: rounding toward +-infinity, or a mode not known here (paths
+    // that set it differently join), rounds to nearest even.
+    pub(super) fn narrow16(&mut self, f: V) -> V {
+        let rtz = self.mode16 == Some(3);
+        let c = self.cur;
+        let x = self.as_int(f);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k13, k16, k31) = (k(self, 13), k(self, 16), k(self, 31));
+        let t = self.s.m.bin(c, Bin::LShr, x, k16);
+        let m = k(self, 0x8000);
+        let sign = self.s.m.bin(c, Bin::And, t, m);
+        let m = k(self, 0x7FFF_FFFF);
+        let a = self.s.m.bin(c, Bin::And, x, m);
+        // Normal halves: the exponent rebased, the mantissa rounded.
+        let bias = k(self, 0x3800_0000);
+        let rebased = self.s.m.bin(c, Bin::Sub, a, bias);
+        let normal = if rtz {
+            self.s.m.bin(c, Bin::LShr, rebased, k13)
+        } else {
+            let one = k(self, 1);
+            let lsb = self.s.m.bin(c, Bin::LShr, rebased, k13);
+            let lsb = self.s.m.bin(c, Bin::And, lsb, one);
+            let half = k(self, 0xFFF);
+            let up = self.s.m.bin(c, Bin::Add, rebased, half);
+            let up = self.s.m.bin(c, Bin::Add, up, lsb);
+            self.s.m.bin(c, Bin::LShr, up, k13)
+        };
+        let (inf, big) = (k(self, 0x7C00), k(self, if rtz { 0x7BFF } else { 0x7C00 }));
+        let over = self.s.m.cmp(c, pred::IUGE, normal, inf);
+        let normal = self.s.m.select(c, over, big, normal);
+        let infinity = k(self, 0x7F80_0000);
+        let is_inf = self.s.m.cmp(c, pred::EQ, a, infinity);
+        let normal = self.s.m.select(c, is_inf, inf, normal);
+        // Denormal halves: the mantissa shifted into units of 2^-24.
+        let k23 = k(self, 23);
+        let e = self.s.m.bin(c, Bin::LShr, a, k23);
+        let k126 = k(self, 126);
+        let s = self.s.m.bin(c, Bin::Sub, k126, e);
+        let far = self.s.m.cmp(c, pred::IUGT, s, k31);
+        let s = self.s.m.select(c, far, k31, s);
+        let (frac, hidden, zero) = (k(self, 0x7F_FFFF), k(self, 0x80_0000), k(self, 0));
+        let mant = self.s.m.bin(c, Bin::And, a, frac);
+        let mant = self.s.m.bin(c, Bin::Or, mant, hidden);
+        let f32_denormal = self.s.m.cmp(c, pred::EQ, e, zero);
+        let mant = self.s.m.select(c, f32_denormal, zero, mant);
+        let q = self.s.m.bin(c, Bin::LShr, mant, s);
+        let den = if rtz {
+            q
+        } else {
+            let one = k(self, 1);
+            let s1 = self.s.m.bin(c, Bin::Sub, s, one);
+            let half = self.s.m.bin(c, Bin::LShr, mant, s1);
+            let half = self.s.m.bin(c, Bin::And, half, one);
+            let below = self.s.m.bin(c, Bin::Shl, one, s1);
+            let below = self.s.m.bin(c, Bin::Sub, below, one);
+            let rest = self.s.m.bin(c, Bin::And, mant, below);
+            let rest = self.s.m.cmp(c, pred::NE, rest, zero);
+            let rest = self.s.m.cast(c, Cast::ZExt, rest, self.s.t.i32);
+            let lsb = self.s.m.bin(c, Bin::And, q, one);
+            let tie = self.s.m.bin(c, Bin::Or, rest, lsb);
+            let up = self.s.m.bin(c, Bin::And, half, tie);
+            self.s.m.bin(c, Bin::Add, q, up)
+        };
+        let min_normal = k(self, 0x3880_0000);
+        let small = self.s.m.cmp(c, pred::IULT, a, min_normal);
+        let r = self.s.m.select(c, small, den, normal);
+        let is_nan = self.s.m.cmp(c, pred::IUGT, a, infinity);
+        // A NaN keeps the top of its payload, quieted, as RDNA2 converts.
+        let payload = self.s.m.bin(c, Bin::LShr, a, k13);
+        let (low10, quiet) = (k(self, 0x3FF), k(self, 0x7E00));
+        let payload = self.s.m.bin(c, Bin::And, payload, low10);
+        let nan = self.s.m.bin(c, Bin::Or, payload, quiet);
+        let r = self.s.m.select(c, is_nan, nan, r);
+        self.s.m.bin(c, Bin::Or, r, sign)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{round16, round16_after};
+    use crate::emit::shader::OPS;
+
+    /// `narrow16`'s integer arithmetic, step for step (`rtz`: toward zero).
+    fn narrow16_bits(x: u32, rtz: bool) -> u32 {
+        let sign = x >> 16 & 0x8000;
+        let a = x & 0x7FFF_FFFF;
+        let rebased = a.wrapping_sub(0x3800_0000);
+        let normal = if rtz {
+            rebased >> 13
+        } else {
+            rebased.wrapping_add(0xFFF).wrapping_add(rebased >> 13 & 1) >> 13
+        };
+        let normal = if normal >= 0x7C00 {
+            if rtz { 0x7BFF } else { 0x7C00 }
+        } else {
+            normal
+        };
+        let normal = if a == 0x7F80_0000 { 0x7C00 } else { normal };
+        let e = a >> 23;
+        let s = 126u32.wrapping_sub(e).min(31);
+        let mant = if e == 0 { 0 } else { a & 0x7F_FFFF | 0x80_0000 };
+        let q = mant >> s;
+        let den = if rtz {
+            q
+        } else {
+            // s is 0 only for normal halves, whose `den` is not taken.
+            let s1 = s.wrapping_sub(1);
+            let half = mant.wrapping_shr(s1) & 1;
+            let rest = u32::from(mant & 1u32.wrapping_shl(s1).wrapping_sub(1) != 0);
+            q + (half & (rest | q & 1))
+        };
+        let r = if a < 0x3880_0000 { den } else { normal };
+        let r = if a > 0x7F80_0000 {
+            a >> 13 & 0x3FF | 0x7E00
+        } else {
+            r
+        };
+        r | sign
+    }
+
+    /// The f16 nearest `x` (or the one toward zero), from its exact value in
+    /// f64; f32 denormals read as zeros, NaNs keep their payload's top quieted.
+    fn reference(x: u32, rtz: bool) -> u32 {
+        let (f, sign) = (f32::from_bits(x), x >> 16 & 0x8000);
+        if f.is_nan() {
+            return sign | 0x7E00 | (x >> 13 & 0x3FF);
+        }
+        if f.is_infinite() {
+            return sign | 0x7C00;
+        }
+        if f == 0.0 || f.is_subnormal() {
+            return sign;
+        }
+        let exp = ((x >> 23 & 0xFF) as i32 - 127).max(-14);
+        let q = f64::from(f.abs()) / 2f64.powi(exp - 10);
+        let r = if rtz { q.trunc() } else { q.round_ties_even() } as u32;
+        let (exp, r) = if r == 2048 { (exp + 1, 1024) } else { (exp, r) };
+        if r < 1024 {
+            return sign | r;
+        }
+        if exp > 15 {
+            return sign | if rtz { 0x7BFF } else { 0x7C00 };
+        }
+        sign | ((exp + 15) as u32) << 10 | (r - 1024)
+    }
+
+    #[test]
+    fn narrow16_rounds_like_the_exact_conversion() {
+        let mut mants = vec![0, 0x7F_FFFF];
+        for p in 0..23 {
+            for h in [1u32, 2, 3, 5, 0x2AB, 0x3FF] {
+                for d in [-1i32, 0, 1] {
+                    mants.push((h << p).wrapping_add_signed(d) & 0x7F_FFFF);
+                }
+            }
+        }
+        let swept = (0..=u32::MAX).step_by(65_521);
+        let patterned = (0..512u32).flat_map(|se| mants.iter().map(move |m| se << 23 | m));
+        for x in swept.chain(patterned) {
+            for rtz in [false, true] {
+                assert_eq!(
+                    narrow16_bits(x, rtz),
+                    reference(x, rtz),
+                    "{x:#010x} rtz {rtz}"
+                );
+            }
+        }
+    }
+
+    fn program(words: &[u32]) -> crate::ir::Program {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::ir::build(&code, false, 8).unwrap()
+    }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn mode_writes_set_the_16_bit_round_mode() {
+        // s_round_mode 0xC; s_setreg_imm32_b32 hwreg(MODE, 2, 2), 0; and
+        // hwreg(MODE, 0, 4), 0xC; s_setreg_b32 hwreg(MODE, 0, 4), s0; s_setreg_imm32_b32
+        // hwreg(MODE, 4, 4), 0 (the 32-bit mode only).
+        let p = program(&[
+            0xBFA4_000C,
+            0xBA80_0881,
+            0,
+            0xBA80_1801,
+            0xC,
+            0xB980_1801,
+            0xBA80_1901,
+            0,
+            S_ENDPGM,
+        ]);
+        let mut m = Some(0);
+        let modes: Vec<_> = (p.blocks[0].insts.iter())
+            .map(|i| {
+                m = round16_after(i, m);
+                m
+            })
+            .collect();
+        assert_eq!(modes, [Some(3), Some(0), Some(3), None, None, None]);
+    }
+
+    #[test]
+    fn a_join_of_different_round_modes_is_not_known() {
+        // s_cmp_eq_u32 s0, 0; s_cbranch_scc1 over one instruction; s_round_mode
+        // `mode`; s_endpgm: the join keeps a mode only both paths agree on.
+        for (mode, before, join) in [(0xC, 0, None), (0xC, 0xC, Some(3)), (0, 0, Some(0))] {
+            let p = program(&[
+                0xBFA4_0000 | before,
+                0xBF06_8000,
+                0xBF85_0001,
+                0xBFA4_0000 | mode,
+                S_ENDPGM,
+            ]);
+            let modes = round16(&p);
+            assert_eq!(modes[0], Some(0));
+            assert_eq!(
+                modes.last(),
+                Some(&join),
+                "{mode:#x} after {before:#x}: {modes:?}"
+            );
+        }
+    }
+
+    /// f16 results narrow on the bits, never through `legacyF32ToF16`.
+    #[test]
+    fn f16_results_do_not_use_the_hosts_conversion() {
+        for (name, body) in [
+            ("v_cvt_f16_f32 v0, v1", &[0x7E00_1501][..]),
+            ("v_add_f16 v0, v1, v2", &[0x6400_0501]),
+            ("v_pk_add_f16 v0, v1, v2", &[0xCC0F_4000, 0x1802_0501]),
+            (
+                "v_fma_mixlo_f16 v0, v1, v2, v3",
+                &[0xCC21_0000, 0x040C_0501],
+            ),
+        ] {
+            OPS.with(|o| o.borrow_mut().clear());
+            super::super::tests::lowers_valu(body).unwrap();
+            let ops = OPS.with(|o| o.take());
+            assert!(!ops.is_empty(), "{name}: no ops recorded");
+            assert!(
+                !ops.iter().any(|o| o == "legacyF32ToF16"),
+                "{name}: {ops:?}"
+            );
         }
     }
 }

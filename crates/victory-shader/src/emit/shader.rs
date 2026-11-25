@@ -24,6 +24,13 @@ pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
 
+#[cfg(test)]
+thread_local! {
+    /// The DXIL ops this thread's lowerings called: Linux tests have no disassembler.
+    pub(crate) static OPS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
@@ -259,6 +266,8 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        #[cfg(test)]
+        OPS.with(|o| o.borrow_mut().push(name.to_owned()));
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);

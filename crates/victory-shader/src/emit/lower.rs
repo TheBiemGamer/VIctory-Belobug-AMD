@@ -610,6 +610,9 @@ struct Lower<'a> {
     lane_paths: Vec<(usize, V)>,
     /// Heap index phis of per-lane joins with predecessors lowered later.
     pending_paths: Vec<PendingPath>,
+    /// MODE's 16/64-bit round mode at each block's start and at this instruction.
+    round16: Vec<Option<u8>>,
+    mode16: Option<u8>,
 }
 
 /// A heap index phi of a [`Source::Paths`], filled once every predecessor is
@@ -1391,6 +1394,8 @@ impl<'a> Lower<'a> {
             abort: None,
             lane_paths: Vec::new(),
             pending_paths: Vec::new(),
+            round16: valu::round16(p),
+            mode16: Some(0),
             dead,
         }
     }
@@ -2093,8 +2098,10 @@ impl<'a> Lower<'a> {
                 }
             }
             let mut i = 0;
+            self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
+                self.mode16 = valu::round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     self.section(b, i, end)?;
                     i = end;
@@ -3431,25 +3438,6 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
-    /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
-    /// the compare and select DXIL specifies gives either zero.
-    fn max_min(&mut self, max: bool, a: V, b: V) -> V {
-        let c = self.cur;
-        let r = self.binary(if max { 35 } else { 36 }, a, b);
-        let (ia, ib) = (self.as_int(a), self.as_int(b));
-        let either = self.s.m.bin(c, Bin::Or, ia, ib);
-        let magnitude = self.s.m.i32(0x7FFF_FFFF);
-        let either = self.s.m.bin(c, Bin::And, either, magnitude);
-        let zero = self.s.m.i32(0);
-        let zeros = self.s.m.cmp(c, pred::EQ, either, zero);
-        // Of two zeros, +0 unless both are -0 (max), -0 unless neither (min).
-        let op = if max { Bin::And } else { Bin::Or };
-        let sign = self.s.m.bin(c, op, ia, ib);
-        let signed = self.as_float(sign);
-        self.s.m.select(c, zeros, signed, r)
-    }
-
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
         self.s.op(
             self.cur,
@@ -3520,32 +3508,6 @@ impl<'a> Lower<'a> {
         let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
         let keep = self.s.m.bin(c, Bin::Or, full, is0);
         self.s.m.select(c, keep, r, t)
-    }
-
-    /// The median of three. With a NaN among them the hardware gives the
-    /// minimum of the three instead (the host's minimum skips NaNs, so that
-    /// is the smallest number among them).
-    ///
-    /// Uses `dx.op.isSpecialFloat.f32` (`IsNaN`) instead of `fcmp uno`: some
-    /// D3D12 drivers (observed on Intel Iris Xe) fold `fcmp uno x, x` to false
-    /// under default shader fast-math, returning the wrong operand when the
-    /// third input is NaN.
-    fn med3(&mut self, a: V, b: V, third: V) -> V {
-        let c = self.cur;
-        let lo = self.binary(36, a, b);
-        let hi = self.binary(35, a, b);
-        let t = self.binary(36, hi, third);
-        let median = self.binary(35, lo, t);
-        let least = self.binary(36, lo, third);
-        let is_nan = |l: &mut Self, x: V| {
-            l.s.op(c, "isSpecialFloat.f32", Attr::ReadNone, l.s.t.i1, 8, &[x])
-        };
-        let nan_a = is_nan(self, a);
-        let nan_b = is_nan(self, b);
-        let nan_c = is_nan(self, third);
-        let ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan_c);
-        self.s.m.select(c, nan, least, median)
     }
 
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
@@ -7700,10 +7662,7 @@ impl<'a> Lower<'a> {
                         None => Ok(None),
                     }
                 };
-                let to_f16 = |l: &mut Self, f: V| {
-                    let i32t = l.s.t.i32;
-                    l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-                };
+                let to_f16 = |l: &mut Self, f: V| l.narrow16(f);
                 let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
                 if name == "v_interp_p1ll_f16" {
@@ -9370,6 +9329,7 @@ impl<'a> Lower<'a> {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
+                    // Not narrow16: the memory unit converts, so MODE's round mode does not apply.
                     let mut h = self
                         .s
                         .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
@@ -11916,7 +11876,7 @@ mod tests {
     /// Lowers a one-thread compute program that copies four root constants
     /// (s0..s3) into v1..v4, runs `body`, and stores v0 to a raw buffer from a
     /// descriptor table, so the vector instructions in `body` have an effect.
-    fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+    pub(super) fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         let mut words = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
