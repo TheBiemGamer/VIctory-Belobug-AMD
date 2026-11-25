@@ -84,6 +84,8 @@ mod container;
 mod d16_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod fuzz_tests;
 #[cfg(test)]
 mod memory_tests;
 #[cfg(all(test, windows))]
