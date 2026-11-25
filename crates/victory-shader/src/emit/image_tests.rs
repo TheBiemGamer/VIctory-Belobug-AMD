@@ -1075,3 +1075,34 @@ fn forms_without_an_sm_6_6_equivalent_name_why() {
         }
     }
 }
+
+/// `image_get_resinfo` of a level past the last reads 0 for every size and
+/// the level count, as on the console (an AMD driver answered for the level
+/// it clamped, xcl ea088a5).
+#[test]
+fn sizes_of_a_level_past_the_last_read_zero() {
+    let Some(host) = host() else { return };
+    let levels = [0, 1, 2, 3, 4, 5, 15, u32::MAX];
+    let lanes = |l: usize| {
+        let n = levels[l % levels.len()];
+        let want = if n < LEVELS {
+            [W >> n, W >> n, 1, LEVELS]
+        } else {
+            [0, 0, 0, LEVELS]
+        };
+        (vec![n], want)
+    };
+    let cases = [case(
+        "past the last level",
+        mimg("image_get_resinfo", 0xF),
+        &[],
+        lanes,
+    )];
+    let texels = leak(level_texels());
+    check(
+        &host,
+        &cases,
+        || View::Levels(W, W, LEVELS, texels),
+        point(false),
+    );
+}

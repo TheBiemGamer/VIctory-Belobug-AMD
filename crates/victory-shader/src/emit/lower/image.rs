@@ -1,7 +1,7 @@
 //! Image instructions: what the host's drivers need beyond `Lower::image`.
 
 use super::Lower;
-use crate::emit::bitcode::Term;
+use crate::emit::bitcode::{Term, V, pred};
 
 impl Lower<'_> {
     /// An MSAA load after a size query of an MSAA view in the same block
@@ -14,5 +14,14 @@ impl Lower<'_> {
             self.s.m.terminate(self.cur, Term::Br(next));
             self.cur = next;
         }
+    }
+
+    /// Whether `mip` is past the last level of the size query `d`: the
+    /// console then reads 0 for every size and keeps the level count.
+    pub(super) fn past_last_level(&mut self, c: usize, d: V, mip: V) -> V {
+        // AMD's driver (RDNA4) answers with the sizes of a level it clamped
+        // (xcl ea088a5).
+        let levels = self.s.m.extract(c, d, 3);
+        self.s.m.cmp(c, pred::IUGE, mip, levels)
     }
 }

@@ -8173,7 +8173,8 @@ impl<'a> Lower<'a> {
             if matches!(kind, 3 | 8) {
                 self.msaa_sized = Some(c);
             }
-            let one = self.s.m.i32(1);
+            let past = (!uav && !matches!(kind, 3 | 8)).then(|| self.past_last_level(c, d, mip));
+            let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
             let present = match kind {
                 1 => [true, false, false, true],
                 2 | 3 | 5 | 6 => [true, true, false, true],
@@ -8183,11 +8184,14 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                let mut x = if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
                     self.s.m.extract(c, d, ch)
                 };
+                if let Some(p) = past.filter(|_| ch < 3) {
+                    x = self.s.m.select(c, p, zero, x);
+                }
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

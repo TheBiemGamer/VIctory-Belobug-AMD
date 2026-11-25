@@ -108,3 +108,50 @@ fn msaa_loads_never_follow_a_size_query_in_one_block() {
         assert_eq!((queries, loads), (2, 2), "{text}");
     }
 }
+
+#[test]
+fn a_level_past_the_last_has_zero_sizes() {
+    let Some(dxc) = dxc() else {
+        return eprintln!("no dxc; DXIL check skipped");
+    };
+    // 2D, 3D and cube: the level's sizes are selected against 0 by
+    // `level >= levels`; the level count is the query's own.
+    for dim in [1, 2, 3] {
+        let (mut words, layout, used) = texture_table();
+        words.extend([0x7E02_02FF, 5]); // v_mov_b32 v1, 5
+        words.extend(mimg(IMAGE_GET_RESINFO, dim, 8, 1));
+        for r in 8..12 {
+            words.extend(keep(r));
+        }
+        words.push(S_ENDPGM);
+        let dxil = lower_with(&words, layout, used).unwrap().dxil;
+        let text = dump(&dxc, &dxil, &format!("levels-{dim}"));
+        let call = text
+            .lines()
+            .find(|l| l.contains("call %dx.types.Dimensions @dx.op.getDimensions("))
+            .unwrap_or_else(|| panic!("{text}"));
+        let d = call.trim().split(' ').next().unwrap();
+        let levels = format!("extractvalue %dx.types.Dimensions {d}, 3");
+        let n = text
+            .lines()
+            .find(|l| l.contains(&levels))
+            .unwrap_or_else(|| panic!("{text}"));
+        let n = n.trim().split(' ').next().unwrap();
+        let past = format!("icmp uge i32 5, {n}");
+        let p = text
+            .lines()
+            .find(|l| l.contains(&past))
+            .unwrap_or_else(|| panic!("{text}"));
+        let p = p.trim().split(' ').next().unwrap();
+        let zeroed = format!("select i1 {p}, i32 0, ");
+        assert_eq!(text.matches(&zeroed).count(), 3, "{text}");
+    }
+    // An MSAA view's query names no level: nothing to compare.
+    let (mut words, layout, used) = texture_table();
+    words.extend(mimg(IMAGE_GET_RESINFO, 6, 8, 1));
+    words.extend(keep(8));
+    words.push(S_ENDPGM);
+    let dxil = lower_with(&words, layout, used).unwrap().dxil;
+    let text = dump(&dxc, &dxil, "levels-msaa");
+    assert!(!text.contains("icmp uge"), "{text}");
+}
