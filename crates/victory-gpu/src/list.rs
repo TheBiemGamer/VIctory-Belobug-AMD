@@ -2298,6 +2298,7 @@ mod tests {
             list.list.Close().expect("command list must close cleanly");
         }
     }
+
     /// CPU-only timing for the lock taken by every recorded draw-state call.
     /// Run with:
     /// `cargo test --release -p victory-gpu --lib benchmark_state_lock -- --ignored --nocapture --test-threads=1`
@@ -2339,5 +2340,4 @@ mod tests {
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }
-
 }

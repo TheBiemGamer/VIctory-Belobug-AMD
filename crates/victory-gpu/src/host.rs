@@ -3149,8 +3149,13 @@ pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + 
     // Workers kept for the run: starting and joining threads at every call
     // was an eighth of the submitting thread's time. Taken by one caller at a
     // time; another caller meanwhile (or one inside a piece) starts its own.
+    // A piece that panicked poisons the turn; the pool itself is still sound.
     if let Some(pool) = Pool::get()
-        && let Ok(_turn) = pool.turn.try_lock()
+        && let Some(_turn) = match pool.turn.try_lock() {
+            Ok(turn) => Some(turn),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     {
         return pool.run(&work);
     }
