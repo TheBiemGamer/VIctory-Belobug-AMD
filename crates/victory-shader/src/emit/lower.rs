@@ -1178,7 +1178,12 @@ impl<'a> Lower<'a> {
             };
             console_lanes = reads_whole || masks_held || live().any(in_half);
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            let group = cs.threads.iter().product::<u32>();
+            let uses_lds = s.lds_dwords > 0
+                && insts().any(|i| {
+                    matches!(i.fields, Fields::Ds { .. } | Fields::Buffer { lds: true, .. })
+                });
+            let one_wave = group > 1 && group <= wave && uses_lds && x.target.lanes_min < group;
             // On a host without 64-lane waves, a wave64 program whose lanes
             // read only their own half runs as two 32-lane waves: what each
             // lane reads is in its host wave, at its host lane's place in the
@@ -1229,7 +1234,7 @@ impl<'a> Lower<'a> {
             }
             if split {
                 s.wave_size = Some(32);
-            } else if console_lanes || one_wave && s.lds_dwords > 0 {
+            } else if console_lanes || one_wave {
                 s.wave_size = Some(wave);
             }
         }

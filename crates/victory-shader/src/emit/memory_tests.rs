@@ -862,3 +862,73 @@ fn memory_opcode_refusals() {
         }
     }
 }
+
+#[test]
+fn one_wave_lds_wave_size_policy() {
+    let psv_wave_min = |body: &[u32], threads: u32, target: super::Target| -> u32 {
+        let mut words = vec![
+            0xBE85_0380u32, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        ];
+        words.extend_from_slice(body);
+        words.push(0xBF81_0000);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 64,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (5 << 1) | (2 << 15),
+                threads: [threads, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let empty = super::container::build(&[]);
+        let hs = emit(&Container::parse(&empty).unwrap(), &native, &p, &st, &io, &res, target)
+            .unwrap();
+        let c = Container::parse(&hs.dxil).unwrap();
+        let psv = c.part(crate::FourCC::PSV0).unwrap().data;
+        // PSVRuntimeInfo2: 4-byte size prefix, then min expected wave lane count at offset 16.
+        u32::from_le_bytes(psv[4 + 16..4 + 20].try_into().unwrap())
+    };
+    let mut lds_body = Vec::new();
+    mov(&mut lds_body, 0, 0);
+    lds_body.extend(ds(0x0D, 0, 0, 0, 0, 0)); // ds_write_b32
+    lds_body.extend(ds(0x36, 0, 1, 0, 0, 0)); // ds_read_b32
+    lds_body.extend(buf(0x1C, 2048, 1, 0));
+    let buf_only = buf(0x18, 2048, 0, 1 << 12);
+    let gcn64 = super::Target {
+        lanes_min: 64,
+        lanes_max: 64,
+    };
+    // 1-thread LDS shader: never needs a fixed WaveSize.
+    assert_eq!(psv_wave_min(&lds_body, 1, super::Target::ANY), 0);
+    // Multi-thread shader with LDS allocated in rsrc2 but no LDS instructions.
+    assert_eq!(psv_wave_min(&buf_only, 8, super::Target::ANY), 0);
+    // Multi-thread LDS shader on a 64-lane-only host: 8 <= 64 already fits one wave.
+    assert_eq!(psv_wave_min(&lds_body, 8, gcn64), 0);
+    // Multi-thread LDS shader on an unconstrained target (lanes_min = 4 < 8): keeps WaveSize(32).
+    assert_eq!(psv_wave_min(&lds_body, 8, super::Target::ANY), 32);
+}
