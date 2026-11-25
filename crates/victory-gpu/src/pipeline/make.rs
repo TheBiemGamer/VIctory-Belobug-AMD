@@ -108,7 +108,22 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+/// `VICTORY_PIPELINE_WAIT_MS` changes it in milliseconds (0 does not wait):
+/// a draw or dispatch whose pipeline is not ready when it is spent is
+/// dropped, as an untranslated one is. The default is half a second.
+fn budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        Duration::from_millis(wait_ms(
+            std::env::var("VICTORY_PIPELINE_WAIT_MS").ok().as_deref(),
+        ))
+    })
+}
+
+/// The wait in `VICTORY_PIPELINE_WAIT_MS`, or 500 ms.
+fn wait_ms(text: Option<&str>) -> u64 {
+    text.and_then(|text| text.parse().ok()).unwrap_or(500)
+}
 
 /// The same for passes over the screen (below the title's 30 s watchdog).
 const SCREEN_BUDGET: Duration = Duration::from_secs(20);
@@ -162,7 +177,7 @@ fn wait(p: &Pending, frame: u64) {
     static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
     static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let kind = usize::from(p.screen);
-    let budget = [BUDGET, SCREEN_BUDGET][kind];
+    let budget = [budget(), SCREEN_BUDGET][kind];
     let waited = &WAITED_US[kind];
     if FRAME[kind].swap(frame, Ordering::Relaxed) != frame {
         waited.store(0, Ordering::Relaxed);
@@ -286,6 +301,41 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wait is the variable when it is a number, and half a second
+    /// otherwise (including when it is not a number at all).
+    #[test]
+    fn pipeline_wait_is_the_variable_or_half_a_second() {
+        assert_eq!(wait_ms(None), 500);
+        assert_eq!(wait_ms(Some("24")), 24);
+        assert_eq!(wait_ms(Some("0")), 0);
+        assert_eq!(wait_ms(Some("nope")), 500);
+    }
+
+    /// The default budget is half a second, not `Duration::default()` (zero).
+    #[test]
+    fn pipeline_wait_default_budget_is_half_a_second() {
+        assert_eq!(budget(), Duration::from_millis(500));
+    }
+
+    /// `wait` blocks until the worker signals that the pipeline is made.
+    #[test]
+    fn pipeline_wait_blocks_for_the_worker() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let signal = p.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = signal.made.set(None);
+            DONE.1.notify_all();
+        });
+        let started = Instant::now();
+        wait(&p, 1);
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "wait returned before the worker signalled"
+        );
+        worker.join().unwrap();
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
