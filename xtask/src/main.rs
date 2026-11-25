@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod perf;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +27,28 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Summarise the frame-rate lines and warnings of run logs (stderr of
+    /// `victory run`); with two logs, compare their steady frames.
+    Perf {
+        #[arg(required = true, num_args = 1..=2)]
+        logs: Vec<PathBuf>,
+        /// Leave out each log's first N frame-rate lines (menus, loading).
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        /// Keep only each log's last N frame-rate lines (after --skip).
+        #[arg(long)]
+        last: Option<usize>,
+    },
+    /// Compare two `VICTORY_PROFILE` files function by function.
+    ProfileDiff { before: PathBuf, after: PathBuf },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Perf { logs, skip, last } => perf::run(&logs, perf::Window { skip, last }),
+        Cmd::ProfileDiff { before, after } => perf::profile_diff(&before, &after),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
