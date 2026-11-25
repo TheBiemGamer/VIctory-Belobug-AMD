@@ -1447,8 +1447,17 @@ impl HostHeap {
                 b.recheck.pop_front();
                 due.push(t as crate::object::This);
             }
+            // With the frame's rechecks spent the due ones wait for the next
+            // frame: the draws left in this one need not come in to find so.
+            let wait = if b.rechecks.0 == frame && b.rechecks.1 >= RECHECKS {
+                frame + 1
+            } else {
+                0
+            };
             self.recheck_at.store(
-                b.recheck.front().map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
+                b.recheck
+                    .front()
+                    .map_or(u64::MAX, |&(f, _)| (f + RECHECK_FRAMES).max(wait)),
                 Ordering::Release,
             );
             self.record_hint
