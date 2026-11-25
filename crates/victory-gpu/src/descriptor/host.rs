@@ -377,6 +377,7 @@ unsafe impl Send for BindlessPlan {}
 unsafe impl Sync for BindlessPlan {}
 
 impl BindlessPlan {
+    #[allow(clippy::type_complexity)]
     /// Copies the misaligned constant buffers into their bounce slices.
     ///
     /// shortcut: all of them once a frame, else only for a plan not copied
@@ -583,18 +584,20 @@ impl HostHeap {
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
+                let most = PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS;
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = wanted.min(most),
+                    lost = wanted.saturating_sub(most),
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
                     make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
+                    // Never more title slots than were asked for.
+                    wanted.min(most),
                     DYNAMIC_CAPPED,
                 )
             }
@@ -1727,11 +1730,13 @@ impl HostHeap {
         let mut made_any = false;
         let mut fresh = Vec::new();
         let mut fresh_reads = Vec::new();
+        #[allow(clippy::type_complexity)]
         let mut results: Vec<(u32, Option<((u32, u32), Option<SlotUse>)>)> =
             Vec::with_capacity(todo.len());
         let mut over: Option<u32> = None;
         let mut todo = todo.into_iter();
         let mut count = 0usize;
+        #[allow(clippy::explicit_counter_loop)]
         for (index, entry) in todo.by_ref() {
             if count >= exempt && (count & 15) == 0 && started.elapsed().as_micros() as u64 > left {
                 // Over budget: the rest waits for the next submission.
@@ -1977,6 +1982,7 @@ impl HostHeap {
         text
     }
 
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
         let key = *self
             .made
@@ -2124,6 +2130,8 @@ fn view_stride(view: &View) -> u32 {
     u32::try_from(bytes).unwrap_or(0)
 }
 
+// A union member is read only once the dimension names it.
+#[allow(clippy::unnecessary_lazy_evaluations)]
 /// The elements of the title's buffer view `view` (0 for other views).
 fn view_count(view: &View) -> u32 {
     let srv = |w: &[u32; 10]| {
