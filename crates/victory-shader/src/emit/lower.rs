@@ -6,6 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+mod guard;
 mod valu;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -6261,6 +6262,7 @@ impl<'a> Lower<'a> {
             self.handle(site, &src, false, props)?
         } else {
             let index = self.heap_index_at(site, skew.wrapping_neg(), false)?;
+            let index = self.buffer_guard(&src, index, false, props);
             self.s.heap_handle(self.cur, index, false, false, props)
         };
         // The size words are asked of the host only when the program reads
@@ -6981,6 +6983,7 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
+                let index = self.buffer_guard(src, index, sampler, props);
                 let h = self.s.heap_handle(self.cur, index, sampler, false, props);
                 self.handles.insert(key, h);
                 Ok(h)
@@ -7082,7 +7085,8 @@ impl<'a> Lower<'a> {
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                let index = self.buffer_guard(src, phi, sampler, props);
+                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -7100,6 +7104,7 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
+                let index = self.buffer_guard(src, index, sampler, props);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::Paths { .. } => {
@@ -7118,6 +7123,7 @@ impl<'a> Lower<'a> {
                     return Err("a per-lane descriptor joined with a VGPR the hardware sets");
                 }
                 let index = self.lane_heap_index(src, sampler)?;
+                let index = self.buffer_guard(src, index, sampler, props);
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
             Source::Carried { .. } | Source::Unset => Err("a per-lane descriptor out of a join"),

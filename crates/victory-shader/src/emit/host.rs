@@ -1106,6 +1106,9 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// Last in the heap, which then reaches the host's null raw buffer SRV at
+    /// [`super::NULL_BUFFER_VIEW`] and UAV below it, both made here.
+    NullBuffers,
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1254,7 +1257,11 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
-            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len())?;
+            let slots = match d.views.last() {
+                Some(View::NullBuffers) => super::NULL_BUFFER_VIEW as usize + 1,
+                _ => d.views.len(),
+            };
+            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
             let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
             let view_size = dev
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
@@ -1535,6 +1542,42 @@ impl Host {
                         };
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
+                    }
+                    View::NullBuffers => {
+                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let (mut srv_at, mut uav_at) = (at, at);
+                        srv_at.ptr += (null - i) * view_size;
+                        uav_at.ptr += (null - 1 - i) * view_size;
+                        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_SRV {
+                                    NumElements: 1,
+                                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: 1,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&srv), srv_at);
+                        dev.CreateUnorderedAccessView(
+                            None::<&ID3D12Resource>,
+                            None::<&ID3D12Resource>,
+                            Some(&uav),
+                            uav_at,
+                        );
                     }
                 }
             }

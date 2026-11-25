@@ -525,25 +525,29 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// frame of some 7,000 draws held over 400,000 of 2^19, and tables of 150
 /// slots no longer fit: the draws that needed them were dropped (the
 /// subsurface resolve, tree imposters). `victory_shader::emit::VIEW_SLOTS`
-/// is the title's 1,245,184 slots, these, one null slot and those of
-/// [`crate::memory`]. The null slot is the one shaders clamp a wild index to
-/// (`OWN_SLOTS - 1`): a live dynamic slot there was read as anything (#144).
-const DYNAMIC: u32 = (1 << 20) - 1;
+/// is the title's 1,245,184 slots, these, the [`NULLS`] and those of
+/// [`crate::memory`].
+const DYNAMIC: u32 = (1 << 20) - NULLS;
 /// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`], also leaving one null slot.
-const DYNAMIC_CAPPED: u32 = (1 << 16) - 1;
+/// [`PORTABLE_VIEWS`], also leaving the [`NULLS`].
+const DYNAMIC_CAPPED: u32 = (1 << 16) - NULLS;
+/// Null slots after the dynamic ones: the raw buffer UAV and SRV shaders read
+/// for a heap slot by index from data without a buffer view
+/// (`NULL_BUFFER_VIEW`), and the clamp target `OWN_SLOTS - 1` (#144).
+const NULLS: u32 = 3;
+const _: () = assert!(victory_shader::emit::NULL_BUFFER_VIEW + 1 == victory_shader::emit::OWN_SLOTS - 1);
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
 const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
 const _: () = assert!(SAMPLERS == victory_shader::emit::SAMPLER_SLOTS);
 
-/// The slots to make of a view heap of `count` title and dynamic slots: one
-/// null slot and those of [`crate::memory`] after them, and enough that
+/// The slots to make of a view heap of `count` title and dynamic slots: the
+/// [`NULLS`] and those of [`crate::memory`] after them, and enough that
 /// shaders' indices, which stay below [`victory_shader::emit::VIEW_SLOTS`],
 /// are inside it.
 fn view_slots(count: u32) -> u32 {
-    let slots = count + 1 + crate::memory::SLOTS;
+    let slots = count + NULLS + crate::memory::SLOTS;
     if cfg!(test) { slots } else { slots.max(victory_shader::emit::VIEW_SLOTS) }
 }
 
@@ -676,7 +680,7 @@ impl HostHeap {
             }
             // A host with room for fewer slots gets no padding.
             let slots = view_slots(count);
-            create(slots).or_else(|_| create(count + 1 + crate::memory::SLOTS))
+            create(slots).or_else(|_| create(count + NULLS + crate::memory::SLOTS))
         };
         if sampler && count > SAMPLERS {
             // shortcut: samplers past the host's limit are left out; tables
@@ -701,8 +705,8 @@ impl HostHeap {
         let wanted = count;
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
-            Err(e) if !sampler && count + extra + 1 + crate::memory::SLOTS > PORTABLE_VIEWS => {
-                let most = PORTABLE_VIEWS - DYNAMIC_CAPPED - 1 - crate::memory::SLOTS;
+            Err(e) if !sampler && count + extra + NULLS + crate::memory::SLOTS > PORTABLE_VIEWS => {
+                let most = PORTABLE_VIEWS - DYNAMIC_CAPPED - NULLS - crate::memory::SLOTS;
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
                 tracing::warn!(
@@ -796,6 +800,13 @@ impl HostHeap {
         }
         if let Err(e) = h.fill_null(kind, total) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+        }
+        let null = victory_shader::emit::NULL_BUFFER_VIEW;
+        if !sampler && null > count + extra && null < h.memory_first {
+            null_buffer_view(h.cpu(null));
+            null_raw_uav(h.cpu(null - 1));
+        } else if !sampler {
+            tracing::warn!(count, extra, total, "no room for the null buffer views: a buffer read at a heap index from data reads what is there");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         h
@@ -2338,24 +2349,32 @@ fn uav_element_size(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<u64> {
     }
 }
 
-/// Element byte stride of `view` for the runtime stride table (`0` for
-/// non-buffer views or descriptors without a known element size).
+/// Element byte stride of `view` for the runtime stride table: at least 1
+/// for a buffer view (4 for a constant buffer view, which shaders read as a
+/// raw buffer), 0 for any other view. Shaders reading a buffer at a heap
+/// index from data read a null view where it is 0.
 fn view_stride(view: &View) -> u32 {
-    let bytes = match view {
-        View::Shader(_, Some(desc)) => element_size(&srv_desc(desc)),
-        View::Placed(false, resource, desc) if resource[0] == 1 => desc[..10]
-            .try_into()
-            .ok()
-            .map_or(0, |w: &[u32; 10]| element_size(&srv_desc(w))),
-        View::Unordered(_, _, Some(desc)) => uav_element_size(&uav_desc(desc)).unwrap_or(0),
-        View::Placed(true, resource, desc) if resource[0] == 1 => desc[..10]
-            .try_into()
-            .ok()
-            .and_then(|w: &[u32; 10]| uav_element_size(&uav_desc(w)))
-            .unwrap_or(0),
-        _ => 0,
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Constant(..) => return 4,
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return 0,
+        },
+        _ => return 0,
     };
-    u32::try_from(bytes).unwrap_or(0)
+    // Buffer is dimension 1 for both kinds; a texture's union read as a
+    // buffer's gave its format size or array size, a nonzero stride.
+    if words[1] != D3D12_SRV_DIMENSION_BUFFER.0 as u32 {
+        return 0;
+    }
+    let bytes = if unordered {
+        uav_element_size(&uav_desc(words)).unwrap_or(0)
+    } else {
+        element_size(&srv_desc(words))
+    };
+    u32::try_from(bytes).unwrap_or(0).max(1)
 }
 
 // A union member is read only once the dimension names it.
@@ -3199,6 +3218,31 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// A raw buffer UAV that reads zeros and drops writes.
+fn null_raw_uav(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device.CreateUnorderedAccessView(
+            None::<&ID3D12Resource>,
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
+    };
+}
+
 /// A texture view that reads zeros with the dimension (and mip and array
 /// counts) of the title's description `words`; 2D if it names none.
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -3294,6 +3338,28 @@ mod tests {
         let word = view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0));
         assert_eq!(word, 8 | VIEW_INTEGER);
         assert_eq!(word & VIEW_STRIDE_BITS, 8, "the stride, for shaders that mask");
+    }
+
+    /// Texture views hold 0 in the stride table, every buffer view a nonzero
+    /// stride: shaders reading a buffer at a heap index from data read a null
+    /// view where it is 0 (`victory_shader::emit::NULL_BUFFER_VIEW`).
+    #[test]
+    fn only_buffer_views_have_a_stride() {
+        // Format, dimension, mapping, first element, count, stride (a 2D
+        // array's size), flags.
+        let srv = |format, dimension, w7, flags| {
+            View::Shader(0, Some([format, dimension, 5768, 0, 0, 0, 64, w7, flags, 0]))
+        };
+        assert_eq!(view_stride(&srv(28, 4, 0, 0)), 0, "an RGBA8 2D texture");
+        assert_eq!(view_stride(&srv(28, 5, 6, 0)), 0, "a 2D array of six");
+        assert_ne!(view_stride(&srv(28, 1, 0, 0)), 0, "a typed RGBA8 buffer");
+        assert_eq!(view_stride(&srv(0, 1, 48, 0)), 48, "structured");
+        assert_eq!(view_stride(&srv(39, 1, 0, 1)), 4, "raw");
+        assert_eq!(view_stride(&srv(0, 1, 0, 0)), 1, "a buffer of no known format");
+        let uav = |dimension| View::Unordered(0, 0, Some([39, dimension, 0, 0, 64, 0, 0, 0, 1, 0]));
+        assert_eq!(view_stride(&uav(1)), 4, "a raw UAV");
+        assert_eq!(view_stride(&uav(4)), 0, "a 2D texture UAV");
+        assert_eq!(view_stride(&View::Constant(0x1000, 256)), 4, "a constant buffer, read raw");
     }
 
     const HEAP_IID: Iid = guid(

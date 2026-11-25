@@ -88,6 +88,8 @@ mod diff_tests;
 mod fuzz_tests;
 #[cfg(test)]
 mod memory_tests;
+#[cfg(test)]
+mod guard_tests;
 #[cfg(all(test, windows))]
 mod image_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -180,6 +182,12 @@ pub const VIEW_SLOTS: u32 = 2_294_784;
 /// Those before the views of memory by address, which programs without
 /// such views stay below.
 pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
+
+/// The host's null raw buffer SRV, read instead of a heap slot that holds no
+/// buffer view where a shader reads a buffer at a heap index from data; the
+/// null raw UAV is the slot below. A texture descriptor read as a buffer one
+/// is a wild address (a GPU fault).
+pub const NULL_BUFFER_VIEW: u32 = OWN_SLOTS - 2;
 
 /// Slots the host's sampler heaps have (`victory-gpu` makes every one this
 /// size, the host's most), which sampler indices stay below.
