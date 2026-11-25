@@ -249,6 +249,8 @@ struct Guards {
     /// they are not made read-only, and every check reports them written.
     /// Each ends `PIN` after it was made, under the lock: in order.
     pins: VecDeque<(usize, usize, std::time::Instant)>,
+    /// How many of `pins` hold each block.
+    pinned: BTreeMap<usize, u32>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -257,6 +259,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holes: BTreeSet::new(),
     aliased: BTreeSet::new(),
     pins: VecDeque::new(),
+    pinned: BTreeMap::new(),
 });
 
 /// How long blocks stay writable after [`writing`].
@@ -265,14 +268,33 @@ const PIN: std::time::Duration = std::time::Duration::from_secs(2);
 impl Guards {
     /// Whether `block` is left writable for a kernel write.
     fn pinned(&self, block: usize) -> bool {
-        self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
+        self.pinned.contains_key(&block)
     }
 
-    /// Forgets the pins that ended.
+    fn pin(&mut self, from: usize, to: usize, until: std::time::Instant) {
+        self.pins.push_back((from, to, until));
+        for block in from..to {
+            *self.pinned.entry(block).or_insert(0) += 1;
+        }
+    }
+
+    /// Forgets the pins that ended. They end in the order they were made, so
+    /// only the front is looked at (filtering all of them at every check was
+    /// 4.5% of the process's CPU time in the world).
     fn unpin_ended(&mut self) {
-        if !self.pins.is_empty() {
-            let now = std::time::Instant::now();
-            self.pins.retain(|&(_, _, until)| until > now);
+        let now = std::time::Instant::now();
+        while let Some(&(from, to, until)) = self.pins.front()
+            && until <= now
+        {
+            self.pins.pop_front();
+            for block in from..to {
+                if let std::collections::btree_map::Entry::Occupied(mut e) = self.pinned.entry(block) {
+                    *e.get_mut() -= 1;
+                    if *e.get() == 0 {
+                        e.remove();
+                    }
+                }
+            }
         }
     }
 }
@@ -755,14 +777,10 @@ pub fn writing(at: usize, len: usize) {
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
     let mut g = guards();
-    let now = std::time::Instant::now();
-    let until = now + PIN;
-    // The pins that ended are dropped here too, or they pile up (and every
-    // check of a block scans them) until a first look at some range.
-    while g.pins.front().is_some_and(|&(_, _, end)| end <= now) {
-        g.pins.pop_front();
-    }
-    g.pins.push_back((first, last, until));
+    let until = std::time::Instant::now() + PIN;
+    // The pins that ended are dropped here too, or they pile up until a first look at some range.
+    g.unpin_ended();
+    g.pin(first, last, until);
     open(&mut g, at, at + len);
     if !view_guard() {
         return;
@@ -785,7 +803,7 @@ pub fn writing(at: usize, len: usize) {
         others
     };
     for alias in others {
-        g.pins.push_back((alias / BLOCK, alias / BLOCK + 1, until));
+        g.pin(alias / BLOCK, alias / BLOCK + 1, until);
         open_here(&mut g, alias, alias + BLOCK);
     }
 }
@@ -1279,8 +1297,12 @@ mod tests {
         };
         title_memory_remapped(view, 2 * BLOCK);
         // So that a view another test maps here is not left writable by it.
-        guards()
-            .pins
-            .retain(|&(from, to, _)| to <= view / BLOCK || from >= view / BLOCK + 2);
+        let mut g = guards();
+        g.pins.retain(|&(from, to, _)| to <= view / BLOCK || from >= view / BLOCK + 2);
+        let kept: Vec<_> = g.pins.drain(..).collect();
+        g.pinned.clear();
+        for (from, to, until) in kept {
+            g.pin(from, to, until);
+        }
     }
 }

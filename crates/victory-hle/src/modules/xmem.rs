@@ -395,6 +395,29 @@ struct Slice {
     index: usize,
 }
 
+/// One section's views: by address (first page shown, pages), and by first
+/// page shown, so a write to some pages finds its views without a walk of all.
+#[derive(Default)]
+struct SectionViews {
+    by_addr: BTreeMap<usize, (usize, usize)>,
+    by_page: std::collections::BTreeSet<(usize, usize)>,
+    /// The most pages any view has shown (never lowered).
+    longest: usize,
+}
+
+impl SectionViews {
+    /// Views showing some of pages `[from, to)`: address, first page, pages.
+    fn showing(&self, from: usize, to: usize) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        let low = from.saturating_sub(self.longest.saturating_sub(1));
+        self.by_page
+            .range((low, 0)..(to, 0))
+            .filter_map(move |&(first, base)| {
+                let pages = self.by_addr.get(&base)?.1;
+                (from < first + pages).then_some((base, first, pages))
+            })
+    }
+}
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
@@ -404,7 +427,7 @@ struct Physical {
     /// The views of each section (by its pointer), by address: the first
     /// page they show and how many. Kept in step with `views` by
     /// `insert_view` and `remove_view`.
-    section_views: HashMap<usize, BTreeMap<usize, (usize, usize)>>,
+    section_views: HashMap<usize, SectionViews>,
     /// Reservations that take physical pages: start, length.
     reservations: Vec<(usize, usize)>,
     /// Of them, those shown whole by one view: start, length, the section.
@@ -428,7 +451,9 @@ impl Physical {
         let section = Arc::as_ptr(&slice.section) as usize;
         let shown = (slice.index, len / PAGE);
         let views = self.section_views.entry(section).or_default();
-        views.insert(at, shown);
+        views.by_addr.insert(at, shown);
+        views.by_page.insert((shown.0, at));
+        views.longest = views.longest.max(shown.1);
         self.views.insert(at, (len, slice));
     }
 
@@ -440,8 +465,10 @@ impl Physical {
 
     fn forget_view(&mut self, at: usize, section: usize) {
         if let Some(views) = self.section_views.get_mut(&section) {
-            views.remove(&at);
-            if views.is_empty() {
+            if let Some((first, _)) = views.by_addr.remove(&at) {
+                views.by_page.remove(&(first, at));
+            }
+            if views.by_addr.is_empty() {
                 self.section_views.remove(&section);
             }
         }
@@ -641,19 +668,15 @@ pub(crate) fn physical_written(pages: &[usize], offset: usize, len: usize) {
         let mut shown = Vec::new();
         for (slice, n) in &runs {
             let (from, to) = (slice.index, slice.index + n);
-            // Only the views of the run's section, as the whole map would
-            // give them (by address).
-            let bases = physical
-                .section_views
-                .get(&(Arc::as_ptr(&slice.section) as usize));
-            for (&base, &(first, pages)) in bases.into_iter().flatten() {
-                let last = first + pages;
-                if first < to && from < last {
-                    let (a, b) = (from.max(first), to.min(last));
-                    shown.push((base + (a - first) * PAGE, (b - a) * PAGE));
-                }
+            // Only the views of the run's section that show the run's pages.
+            let views = physical.section_views.get(&(Arc::as_ptr(&slice.section) as usize));
+            for (base, first, pages) in views.into_iter().flat_map(|v| v.showing(from, to)) {
+                let (a, b) = (from.max(first), to.min(first + pages));
+                shown.push((base + (a - first) * PAGE, (b - a) * PAGE));
             }
         }
+        // By address, as the whole map would give them.
+        shown.sort_unstable();
         shown
     };
     for (at, len) in shown {

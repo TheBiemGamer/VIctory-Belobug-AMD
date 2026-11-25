@@ -407,6 +407,20 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
+    // A view already listed only needs reading: under the write lock every rebind made the
+    // other recording threads' `view` calls spin (3% of the process, run 3).
+    {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(&i) = views.index.get(&view) {
+            let generation = views.list[i as usize].1;
+            // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+            unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+            drop(views);
+            #[cfg(windows)]
+            mirror(handle);
+            return;
+        }
+    }
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let i = match views.index.get(&view) {
         Some(&i) => i,

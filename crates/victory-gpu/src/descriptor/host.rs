@@ -1117,14 +1117,20 @@ impl HostHeap {
     ) {
         // A running submission may still read the old resource through
         // this slot; it is retired outside the lock.
+        // A slot made again to what it held keeps it: retiring and holding the same object
+        // anew was 5% of the recording threads' time in the world.
         let old = {
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            kept.get_mut(index as usize)
-                .and_then(|slot| std::mem::replace(slot, resource))
+            match kept.get_mut(index as usize) {
+                Some(slot) if *slot == resource => None,
+                Some(slot) => std::mem::replace(slot, resource),
+                None => None,
+            }
         };
         let old_tex = {
             let mut texs = self.kept_textures.lock().unwrap_or_else(|e| e.into_inner());
             match texture {
+                Some(t) if texs.get(&index).is_some_and(|o| Arc::ptr_eq(o, &t)) => None,
                 Some(t) => texs.insert(index, t),
                 None => texs.remove(&index),
             }
