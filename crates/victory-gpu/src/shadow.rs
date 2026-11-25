@@ -1147,6 +1147,9 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let page = PAGE as u64;
     let window = run_of(address & !(page - 1), end.next_multiple_of(page)).and_then(|(start, stop)| {
+        if over_system_budget(stop - start) {
+            return None;
+        }
         // Read-only guards would refuse the GPU's writes.
         crate::watch::writing(start as usize, (stop - start) as usize);
         // SAFETY: committed memory; the heap keeps its pages.
@@ -1248,7 +1251,7 @@ fn through_another_view(
     let (start, stop, section, offset) =
         crate::watch::stretch(address as usize, end as usize, WINDOW_REACH as usize)?;
     let len = stop - start;
-    if len < STRETCH_LEAST {
+    if len < STRETCH_LEAST || over_system_budget(len as u64) {
         return None;
     }
     // SAFETY: a section the runtime told us of, alive while it has views;
@@ -1292,6 +1295,50 @@ fn through_another_view(
         );
     }
     window
+}
+
+/// Whether a window of `len` bytes used in place would take the host GPU's
+/// system memory past its share of the driver's budget for it.
+///
+/// Title memory used in place counts against that budget (the
+/// `NON_LOCAL` segment), which Windows sizes at about half of RAM: about
+/// 8 GB on a machine with 16 GB, where in-place windows, upload buffers and
+/// staging together ran it out seconds into the world and every allocation
+/// after that failed (#147). Such a window is copied instead, as memory the
+/// host GPU cannot use in place is. The share is
+/// `VICTORY_IN_PLACE_SYSTEM_PERCENT` (50 by default; 100 turns the check off).
+fn over_system_budget(len: u64) -> bool {
+    static PERCENT: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("VICTORY_IN_PLACE_SYSTEM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(50, |p| p.min(100))
+    });
+    // Off: the driver is not asked either.
+    if *PERCENT >= 100 {
+        return false;
+    }
+    let Some([_, (used, budget)]) = crate::host::video_memory() else {
+        return false;
+    };
+    if budget == 0 {
+        return false;
+    }
+    let over = used.saturating_add(len) > budget / 100 * *PERCENT;
+    if over {
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 4 || count.is_power_of_two() {
+            tracing::info!(
+                count,
+                used_mib = used >> 20,
+                budget_mib = budget >> 20,
+                len,
+                "title memory in place would pass the host GPU's system-memory share: copied"
+            );
+        }
+    }
+    over
 }
 
 /// Where the unmapped title memory `address` is in ends, if it is.
