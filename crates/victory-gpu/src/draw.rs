@@ -2034,10 +2034,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
-        && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
-    {
+    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
@@ -2190,5 +2187,64 @@ mod group_limit_tests {
         assert!(!super::dispatch_fits(65_536, 1, 1));
         assert!(!super::dispatch_fits(1, u32::MAX, 1));
         assert!(!super::dispatch_fits(1, 1, 65_536));
+    }
+
+    #[test]
+    fn readable_refreshes_own_copy_on_execute() {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mem = crate::resource::Memory::zeroed(64 << 10, 64 << 10).unwrap();
+        let copy_addr = mem.address();
+        // SAFETY: `copy_addr + 8` lies within the zeroed 64 KiB block.
+        unsafe { ((copy_addr + 8) as *mut u32).write(0x1357_2468) };
+        crate::shadow::register(copy_addr as usize, copy_addr, 4096);
+
+        let mut res = [0u32; 14];
+        res[0] = 1; // BUFFER
+        res[4] = 2048;
+        res[6] = 1;
+        res[7] = 1;
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: 4,
+                    StructureByteStride: 32,
+                    ..Default::default()
+                },
+            },
+        };
+        let mut desc = [0u32; 16];
+        // SAFETY: POD D3D12 view desc.
+        desc[..10].copy_from_slice(&unsafe { std::ptr::from_ref(&uav).cast::<[u32; 10]>().read() });
+        desc[10] = (copy_addr + 8) as u32;
+        desc[11] = ((copy_addr + 8) >> 32) as u32;
+        let view = crate::descriptor::View::Placed(true, res, desc);
+        let used = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Other(0),
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 32,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let list = host.new_list().unwrap();
+        super::readable(&list, &used, &view);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+
+        let (own, addr, len) = crate::descriptor::host::buffer_copy(&view).unwrap();
+        assert_eq!((addr, len), (copy_addr + 8, 128));
+        assert_eq!(own.test_read_u32(copy_addr + 8), 0x1357_2468);
+        crate::shadow::remapped(copy_addr, copy_addr + 4096);
     }
 }

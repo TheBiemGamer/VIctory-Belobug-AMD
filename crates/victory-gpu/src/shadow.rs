@@ -296,6 +296,13 @@ impl Shadow {
         self.inside(address, len)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_read_u32(&self, address: u64) -> u32 {
+        let off = self.offset(address) as usize;
+        // SAFETY: caller ensures `address` lies within this shadow's mapped buffer.
+        unsafe { self.data.add(off).cast::<u32>().read_volatile() }
+    }
+
     /// Merges GPU-modified 64 KiB pieces (fetched from VRAM into `runs`:
     /// `(first_piece, count, readback_ptr)`) into title memory and `card.staging`.
     /// Returns bytes written to title memory.
@@ -1398,6 +1405,11 @@ pub(crate) fn remapped(start: u64, end: u64) {
     use windows::core::Interface;
     filled(start, end);
     crate::memory::remapped(start, end);
+    EXACT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .1
+        .retain(|&(addr, len), _| addr >= end || addr.saturating_add(len) <= start);
     let mut map = windows_of_memory();
     if map.is_empty() {
         return;
@@ -1454,6 +1466,61 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shado
         }
         Some(copy)
     })
+}
+
+/// Copies of single buffer views' own bytes ([`exact`]), keyed by
+/// `(address, len)` along with the asking tick when last retrieved.
+#[allow(clippy::type_complexity)]
+static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> =
+    Mutex::new((0, BTreeMap::new()));
+
+fn prune_exact(
+    map: &mut BTreeMap<(u64, u64), (Arc<Shadow>, u64)>,
+    now: u64,
+    many: usize,
+    lately: u64,
+) {
+    if map.len() >= many {
+        // Held by the map alone (no list), its buffer by the copy alone
+        // (no descriptor slot shows it), and not asked for lately.
+        map.retain(|_, (shadow, used)| {
+            Arc::strong_count(shadow) > 1
+                || crate::host::references(&shadow.buffer) > 1
+                || *used + lately > now
+        });
+    }
+}
+
+/// A copy of title memory `[address, address + len)` that starts at
+/// `address` itself: for a buffer view whose bytes do not start on an
+/// element of its buffer's copy or violate raw 16-byte start alignment.
+pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    const MANY: usize = 256;
+    const LATELY: u64 = 512;
+    exact_with(address, len, MANY, LATELY)
+}
+
+fn exact_with(address: u64, len: u64, many: usize, lately: u64) -> Option<Arc<Shadow>> {
+    if len == 0 {
+        return None;
+    }
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    *tick += 1;
+    let now = *tick;
+    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        *used = now;
+        return Some(shadow.clone());
+    }
+    prune_exact(map, now, many, lately);
+    let _ = crate::host::moment();
+    let (buffer, data) = crate::host::host()?.shared_buffer(len.next_multiple_of(256))?;
+    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len, None));
+    map.insert((address, len), (shadow.clone(), now));
+    Some(shadow)
 }
 
 /// Copies of title memory the host GPU cannot use in place: a buffer as long
@@ -3037,5 +3104,59 @@ mod tests {
                 assert_eq!((&t1, &o1), (&t2, &o2));
             }
         }
+    }
+
+    #[test]
+    fn exact_cache_reuses_prunes_idle_and_drops_on_remap() {
+        assert!(exact(0x1000, 0).is_none());
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let a = exact(0x8_0000_0040, 128).unwrap();
+        let a2 = exact(0x8_0000_0040, 128).unwrap();
+        assert!(Arc::ptr_eq(&a, &a2));
+        drop(a2);
+        let b = exact(0x8_0001_0000, 128).unwrap();
+        // Overlapping remap evicts `a` while leaving disjoint `b`.
+        remapped(0x8_0000_0000, 0x8_0000_0200);
+        let a3 = exact(0x8_0000_0040, 128).unwrap();
+        assert!(!Arc::ptr_eq(&a, &a3));
+        assert!(Arc::ptr_eq(&b, &exact(0x8_0001_0000, 128).unwrap()));
+
+        // Exercise all four retention conditions in `prune_exact`.
+        let make = |addr| {
+            let (buffer, data) = host.shared_buffer(256).unwrap();
+            Arc::new(Shadow::new(buffer, data, 0, addr, 64, None))
+        };
+        let mut map = BTreeMap::new();
+        let held_arc = make(0x1000);
+        let held_com = make(0x2000);
+        let _extra_ref = held_com.buffer.clone();
+        map.insert((0x1000, 64), (held_arc.clone(), 0));
+        map.insert((0x2000, 64), (held_com, 0));
+        map.insert((0x3000, 64), (make(0x3000), 11)); // recent (11 + 10 > 20)
+        map.insert((0x4000, 64), (make(0x4000), 10)); // boundary stale (10 + 10 == 20)
+        prune_exact(&mut map, 20, 5, 10);
+        assert_eq!(map.len(), 4, "below `many` threshold keeps everything");
+        prune_exact(&mut map, 20, 4, 10);
+        assert!(map.contains_key(&(0x1000, 64)));
+        assert!(map.contains_key(&(0x2000, 64)));
+        assert!(map.contains_key(&(0x3000, 64)));
+        assert!(!map.contains_key(&(0x4000, 64)));
+        drop(a);
+        drop(a3);
+        drop(b);
+        // Advancing `tick` inside `exact_with` ages and prunes unheld idle entries.
+        let idle = exact_with(0x8_0003_0000, 64, 2, 1).unwrap();
+        let active = exact_with(0x8_0004_0000, 64, 2, 1).unwrap();
+        let old_ptr = Arc::as_ptr(&idle);
+        drop(idle);
+        let newest = exact_with(0x8_0005_0000, 64, 2, 1).unwrap();
+        let fresh = exact_with(0x8_0003_0000, 64, 2, 1).unwrap();
+        assert_ne!(Arc::as_ptr(&fresh), old_ptr);
+        drop(active);
+        drop(newest);
+        drop(fresh);
+        remapped(0x8_0000_0000, 0x8_0006_0000);
     }
 }

@@ -78,6 +78,35 @@ static PREWARM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// waited for and its results put back.
 static FINISHED_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Milliseconds since the first call.
+pub(crate) fn now_ms() -> u64 {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+fn moment_from(frame: u64, ms: u64) -> u64 {
+    // Disjoint 32-bit halves: `+` matches `|` and avoids equivalent `|` -> `^` mutants.
+    (frame << 32) + ((ms / 100) & 0xffff_ffff)
+}
+
+/// Frames begun so far (high half) and tenths of a second since start (low half).
+pub(crate) fn moment() -> u64 {
+    moment_from(crate::frame::current(), now_ms())
+}
+
+/// COM reference count on a live host object (ours all, since views/commands hold none).
+pub(crate) fn references(object: &impl Interface) -> u32 {
+    type Method = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+    let raw = object.as_raw();
+    // SAFETY: a live COM object whose `IUnknown` slots 1 and 2 are `AddRef`
+    // and `Release`; pairing them leaves the count unchanged and returns it.
+    unsafe {
+        let table = *raw.cast::<*const Method>();
+        (*table.add(1))(raw);
+        (*table.add(2))(raw)
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
@@ -4765,4 +4794,34 @@ fn wait_if_removed(device: &ID3D12Device, error: &windows::core::Error) {
         tracing::error!(?reason, layer = ?host().and_then(|h| h.log_messages()), "host GPU device gone");
     });
     std::thread::sleep(std::time::Duration::from_secs(20));
+}
+
+#[cfg(test)]
+mod own_copy_host_tests {
+    use super::*;
+
+    #[test]
+    fn moment_and_references_track_frames_time_and_com_count() {
+        assert_eq!(moment_from(3, 550), (3u64 << 32) | 5);
+        assert_eq!(moment_from(1, (u64::from(u32::MAX) + 2) * 100), (1u64 << 32) | 1);
+        let t0 = now_ms();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        while now_ms() == t0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(now_ms() > t0);
+        crate::queue::pass_frame();
+        assert_eq!(moment() >> 32, crate::frame::current());
+        assert_ne!(moment(), 0);
+
+        let Some(host) = host() else {
+            return;
+        };
+        let (buf, _) = host.shared_buffer(256).unwrap();
+        assert_eq!(references(&buf), 1);
+        let cloned = buf.clone();
+        assert_eq!(references(&buf), 2);
+        drop(cloned);
+        assert_eq!(references(&buf), 1);
+    }
 }
