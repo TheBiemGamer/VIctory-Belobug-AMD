@@ -27,7 +27,9 @@ struct Fields {
 }
 
 impl Fields {
-    fn host(&self) -> D3D12_SAMPLER_DESC {
+    /// `point_mip`: the device filters anisotropically with a point mip
+    /// filter; without it such a sampler takes the linear one.
+    fn host(&self, point_mip: bool) -> D3D12_SAMPLER_DESC {
         let linear = |f: u32| u32::from(f == 1 || f == 3);
         let aniso = self.mag >= 2 || self.min >= 2;
         // The console compares when the instruction says so, with the
@@ -43,7 +45,7 @@ impl Fields {
             _ => u32::from(compares),
         };
         let filter = if aniso {
-            0x55
+            0x54 | u32::from(self.mip == 2 || !point_mip)
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
@@ -118,7 +120,7 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
         compare: words[16],
         border: [f(17), f(18), f(19), f(20)],
     }
-    .host()
+    .host(crate::host::aniso_point_mip())
 }
 
 #[cfg(test)]
@@ -143,6 +145,33 @@ mod tests {
         assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
         w[16] = 1;
         assert_eq!(console(&w).Filter.0, 0x5);
+    }
+
+    /// Anisotropic filtering keeps a point (or no) mip filter where the
+    /// device has it, with the reduction bits; the linear one otherwise.
+    #[test]
+    fn anisotropic_samplers_keep_a_point_mip_filter() {
+        let fields = |mip: u32, mode: u32, compare: u32| Fields {
+            mag: 3,
+            min: 3,
+            mip,
+            mode,
+            address: [0; 3],
+            min_lod: 0.0,
+            max_lod: 0.0,
+            bias: 0.0,
+            anisotropy: 16,
+            compare,
+            border: [0.0; 4],
+        };
+        // A less test (2) makes the plain mode a comparison sampler.
+        for (mode, compare, reduction) in [(0, 0, 0), (0, 2, 0x80), (1, 0, 0x100), (2, 0, 0x180)] {
+            for (mip, point) in [(0, 0x54), (1, 0x54), (2, 0x55)] {
+                let f = fields(mip, mode, compare);
+                assert_eq!(f.host(true).Filter.0 as u32, point | reduction, "{mip} {mode}");
+                assert_eq!(f.host(false).Filter.0 as u32, 0x55 | reduction, "{mip} {mode}");
+            }
+        }
     }
 
     #[test]

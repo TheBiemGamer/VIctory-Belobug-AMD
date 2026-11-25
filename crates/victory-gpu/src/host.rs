@@ -289,6 +289,32 @@ pub(crate) fn video_memory() -> Option<[(u64, u64); 2]> {
     ])
 }
 
+/// Whether the host device filters anisotropically with a point mip filter
+/// (`D3D12_OPTIONS19`); false before there is a device, cached once there is.
+pub(crate) fn aniso_point_mip() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    if let Some(&s) = SUPPORTED.get() {
+        return s;
+    }
+    let Some(h) = HOST.get().and_then(Option::as_ref) else {
+        return false;
+    };
+    *SUPPORTED.get_or_init(|| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the query writes the structure of the given size. Older
+        // runtimes may not know OPTIONS19: no support.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool()
+    })
+}
+
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
