@@ -1290,36 +1290,27 @@ impl Host {
         let first = early.record(self);
         // Deduplicate GPU write ranges once before execution so VRAM card
         // shadows get pre-uploaded / Wave64-hashed in the same GPU wait.
+        // A set beside the lists: every list of a world frame declares the
+        // same ranges again, and a scan of the list per range was quadratic.
         let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
             Vec::new();
         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut add = |shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize| {
+            if seen.insert((std::sync::Arc::as_ptr(shadow) as usize, address, len)) {
+                let target = if shadow.is_card() { &mut card_writes } else { &mut cpu_back };
+                target.push((shadow.clone(), address, len));
+            }
+        };
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step {
-                    let target = if shadow.is_card() {
-                        &mut card_writes
-                    } else {
-                        &mut cpu_back
-                    };
-                    if !target.iter().any(|(s, a, l)| {
-                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                    }) {
-                        target.push((shadow.clone(), *address, *len));
-                    }
+                    add(shadow, *address, *len);
                 }
             }
         }
         for (shadow, address, len) in batch.bindless_writes.drain(..) {
-            let target = if shadow.is_card() {
-                &mut card_writes
-            } else {
-                &mut cpu_back
-            };
-            if !target.iter().any(|(s, a, l)| {
-                std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len)
-            }) {
-                target.push((shadow, address, len));
-            }
+            add(&shadow, address, len);
         }
         let (card_before, card_plan, mut card_after) =
             if self.card.get().and_then(|o| o.as_ref()).is_some() || !card_writes.is_empty() {
