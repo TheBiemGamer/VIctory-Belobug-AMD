@@ -29,7 +29,7 @@
 //! time. A system call writing into a guarded block fails (none is known
 //! to).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -216,7 +216,8 @@ struct Guards {
     /// asynchronous and land after the call that asked for it returned, and
     /// the kernel does not fault into our handler, it fails. Until then
     /// they are not made read-only, and every check reports them written.
-    pins: Vec<(usize, usize, std::time::Instant)>,
+    /// Each ends `PIN` after it was made, under the lock: in order.
+    pins: VecDeque<(usize, usize, std::time::Instant)>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -224,7 +225,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     holes: BTreeSet::new(),
     aliased: BTreeSet::new(),
-    pins: Vec::new(),
+    pins: VecDeque::new(),
 });
 
 /// How long blocks stay writable after [`writing`].
@@ -653,25 +654,38 @@ pub fn writing(at: usize, len: usize) {
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
     let mut g = guards();
-    let until = std::time::Instant::now() + PIN;
-    g.pins.push((first, last, until));
+    let now = std::time::Instant::now();
+    let until = now + PIN;
+    // The pins that ended are dropped here too, or they pile up (and every
+    // check of a block scans them) until a first look at some range.
+    while g.pins.front().is_some_and(|&(_, _, end)| end <= now) {
+        g.pins.pop_front();
+    }
+    g.pins.push_back((first, last, until));
     open(&mut g, at, at + len);
     if !view_guard() {
         return;
     }
     // The same pages at their other views: the write lands in them too, so
-    // their copies must take them again, now and when it has landed.
-    for block in first..last {
-        let shown = aliases(block * BLOCK);
-        if shown.len() < 2 || shown.len() > MANY_VIEWS {
-            continue;
-        }
-        for alias in shown {
-            if alias / BLOCK != block {
-                g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
-                open_here(&mut g, alias, alias + BLOCK);
+    // their copies must take them again, now and when it has landed. One look
+    // at the views for the whole range, and a list only of the other views of
+    // pages with several (a lock and a list for each block before, which
+    // every copy into title memory waited for under the guards' lock).
+    let others = {
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(views) = views.as_ref() else { return };
+        let mut others = Vec::new();
+        for block in first..last {
+            let shown = views.shown(block * BLOCK);
+            if (2..=MANY_VIEWS).contains(&shown.len()) {
+                others.extend(shown.iter().filter(|&&alias| alias / BLOCK != block));
             }
         }
+        others
+    };
+    for alias in others {
+        g.pins.push_back((alias / BLOCK, alias / BLOCK + 1, until));
+        open_here(&mut g, alias, alias + BLOCK);
     }
 }
 
