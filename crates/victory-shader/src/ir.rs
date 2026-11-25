@@ -1,7 +1,8 @@
 //! One-to-one SSA form of a native program (decision 0003, step 1).
 //!
 //! Every machine instruction becomes one [`Inst`], except scheduling-only
-//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...), which are dropped.
+//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...) and redundant conditional
+//! branches.
 //! Each register dword is a variable: a read names the [`Value`] it sees, a
 //! write defines a new one, and [`Phi`]s merge values where control flow
 //! joins. Nothing is raised: an instruction keeps its opcode and decoded
@@ -196,6 +197,15 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         })?;
         let fields = machine.fields(wave64);
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
+        // A conditional SOPP branch to fallthrough reads only its condition,
+        // and both edges reach the same block: one edge to the join. Calls also use Flow::Branch
+        // but write a return address.
+        if machine.encoding == gfx10::Encoding::Sopp
+            && matches!(flow, Flow::Branch(target) if Some(target) == next)
+        {
+            blocks[b].exit = Exit::Jump(fallthrough()?);
+            continue;
+        }
         let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
         if ends {
             blocks[b].exit = match flow {
@@ -1505,6 +1515,20 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn a_conditional_branch_to_the_next_instruction_is_a_jump() {
+        let p = build_words(
+            &[
+                0xBF84_0000, // s_cbranch_scc0 +0: to the next instruction
+                0x7E00_0280, // v_mov_b32 v0, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        assert!(p.blocks.iter().all(|b| !matches!(b.exit, Exit::Branch { .. })));
+        assert!(p.blocks.iter().all(|b| b.insts.iter().all(|i| i.name() != "s_cbranch_scc0")));
     }
 
     #[test]
