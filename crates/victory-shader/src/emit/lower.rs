@@ -7,6 +7,9 @@
 //! program when something with an effect (an export, a branch) needs it.
 
 mod guard;
+mod image;
+#[cfg(test)]
+mod image_tests;
 mod valu;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -509,6 +512,8 @@ struct Lower<'a> {
     rpo: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
     tail: Vec<Option<usize>>,
+    /// The DXIL block of the last size query of an MSAA view.
+    msaa_sized: Option<usize>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
     wide_lds: bool,
@@ -1340,6 +1345,7 @@ impl<'a> Lower<'a> {
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
+            msaa_sized: None,
             writes_uavs,
             wide_lds,
             src0: None,
@@ -6296,6 +6302,9 @@ impl<'a> Lower<'a> {
         let d = self
             .s
             .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        if image.is_some_and(|k| matches!(k, 3 | 8)) {
+            self.msaa_sized = Some(c);
+        }
         let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
         let words: Vec<(u32, V)> = match image {
             Some(kind) => {
@@ -7920,6 +7929,7 @@ impl<'a> Lower<'a> {
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
         let guard = self.guard(b, i)?;
+        self.msaa_load_block(name, *dim);
         let c = self.cur;
         let (kind, coords) = match dim {
             0 => (1, 1),
@@ -8160,6 +8170,9 @@ impl<'a> Lower<'a> {
             let d = self
                 .s
                 .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            if matches!(kind, 3 | 8) {
+                self.msaa_sized = Some(c);
+            }
             let one = self.s.m.i32(1);
             let present = match kind {
                 1 => [true, false, false, true],
@@ -10785,7 +10798,7 @@ mod tests {
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
-    fn lower_with(
+    pub(super) fn lower_with(
         words: &[u32],
         layout: Vec<RootParam>,
         used: Vec<UsedResource>,
@@ -10848,7 +10861,7 @@ mod tests {
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
-    fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
+    pub(super) fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
         RootParam {
             root,
             table_offset_dwords: 0,
@@ -11413,7 +11426,7 @@ mod tests {
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
-    fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+    pub(super) fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
         let range = |kind, user_data, slot| UsedResource {
             kind,
             root: RootType::Table,
