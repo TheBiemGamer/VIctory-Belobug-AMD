@@ -996,6 +996,14 @@ extern "system" fn copy_texture_region(
             if crate::resource::skipped_mips(src.resource) > 0 {
                 return;
             }
+            // Two title textures over one memory share a host texture: a copy of
+            // a subresource onto itself, which the host refuses (as `copy_resource`).
+            if texture == to
+                && dst.kind != FOOTPRINT
+                && src.footprint.offset as u32 == dst.footprint.offset as u32
+            {
+                return;
+            }
             if crate::texture::title_written(src.resource) {
                 crate::texture::upload(list, src.resource, texture);
             }
