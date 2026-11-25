@@ -807,8 +807,10 @@ impl HostHeap {
         if FAILED[1].load(Ordering::Relaxed) >= WALKS {
             return None;
         }
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
+        // Search from `next` on, then from the start to n - 1 past `next`
+        // (exclusive): a free run the cursor falls inside is found too.
+        let cursor = *next as usize;
+        let starts = (cursor..spare).chain(0..(cursor + n - 1).min(spare));
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -3031,6 +3033,21 @@ void main() {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.spare - 40));
+    }
+
+    /// A free run the search cursor falls inside is found: with every slot
+    /// taken and the cursor at 14, 10..18 given back takes 8.
+    #[test]
+    fn a_free_run_across_the_cursor_is_found() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let a = heap.dynamic(14).unwrap();
+        heap.dynamic(heap.spare - 14).unwrap();
+        heap.release(a, 14);
+        assert_eq!(heap.dynamic(14), Some(4));
+        heap.release(4 + 10, 8);
+        assert_eq!(heap.dynamic(8), Some(4 + 10));
     }
 
     /// A sampler heap past the host's limit is capped, not lost, and keeps
