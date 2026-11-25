@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 #[cfg(not(windows))]
@@ -58,6 +59,11 @@ struct Tally {
     exports: BTreeMap<&'static str, usize>,
     /// Exports still packed as f16 pairs after the export patch.
     compressed: usize,
+    /// Time spent on containers, over all threads.
+    busy: Duration,
+    /// The slowest containers, slowest first, and how many are kept.
+    slowest: Vec<(Duration, String)>,
+    keep: usize,
     /// Vertex and pixel programs every earlier stage handled, and how far
     /// emission got with them.
     emit_programs: usize,
@@ -95,7 +101,24 @@ impl Tally {
             .0 += 1;
     }
 
+    /// Notes a container's time, keeping the slowest.
+    fn time(&mut self, took: Duration, label: impl FnOnce() -> String) {
+        self.busy += took;
+        if self.keep == 0
+            || (self.slowest.len() == self.keep && self.slowest.last().is_some_and(|s| s.0 >= took))
+        {
+            return;
+        }
+        let at = self.slowest.partition_point(|s| s.0 >= took);
+        self.slowest.insert(at, (took, label()));
+        self.slowest.truncate(self.keep);
+    }
+
     fn merge(&mut self, other: Tally) {
+        self.busy += other.busy;
+        self.slowest.extend(other.slowest);
+        self.slowest.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        self.slowest.truncate(self.keep);
         self.containers += other.containers;
         self.duplicates += other.duplicates;
         self.programs += other.programs;
@@ -166,7 +189,10 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
     host_lanes: Option<(u32, u32)>,
+    slowest: Option<usize>,
 ) -> Result<()> {
+    let started = Instant::now();
+    let most = slowest.unwrap_or(0);
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -203,7 +229,10 @@ pub fn run(
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
-    let total = Mutex::new(Tally::default());
+    let total = Mutex::new(Tally {
+        keep: most,
+        ..Tally::default()
+    });
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -222,6 +251,7 @@ pub fn run(
                     s.spawn(|| {
                         let mut t = Tally {
                             list,
+                            keep: most,
                             ..Tally::default()
                         };
                         let mut checks = Checks {
@@ -235,7 +265,10 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let began = Instant::now();
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            let label = || format!("{}{}", entry.path().display(), job.label());
+                            t.time(began.elapsed(), label);
                         }
                         lock(&total).merge(t);
                     });
@@ -244,6 +277,11 @@ pub fn run(
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "time         {:.1} s wall, {:.1} s on containers summed over up to {threads} threads",
+        started.elapsed().as_secs_f64(),
+        t.busy.as_secs_f64()
+    );
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
@@ -309,6 +347,12 @@ pub fn run(
             };
             println!("pair {v} + {p}: {made}");
         }
+    }
+    if !t.slowest.is_empty() {
+        println!("slowest      {} containers", t.slowest.len());
+    }
+    for (took, label) in &t.slowest {
+        println!("  {:>9.1} ms  {label}", took.as_secs_f64() * 1e3);
     }
     let mut lines = t.lines;
     lines.sort();

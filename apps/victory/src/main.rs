@@ -90,6 +90,10 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Also list the N containers that took longest to translate (and
+        /// check), with the time each took.
+        #[arg(long, value_name = "N")]
+        slowest: Option<usize>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -159,7 +163,8 @@ fn main() -> Result<()> {
             list,
             jobs,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+            slowest,
+        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes, slowest),
         Command::Run {
             exe,
             unimplemented,
