@@ -174,6 +174,9 @@ pub const VIEW_SLOTS: u32 = 2_294_784;
 /// such views stay below.
 pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
 
+/// Slots the host's sampler heaps have (`victory-gpu` makes every one this
+/// size, the host's most), which sampler indices stay below.
+pub const SAMPLER_SLOTS: u32 = 2048;
 
 /// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
 /// take them from title data, and one past the heap stops the host GPU.

@@ -519,6 +519,7 @@ const DYNAMIC_CAPPED: u32 = 1 << 16;
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
 const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+const _: () = assert!(SAMPLERS == victory_shader::emit::SAMPLER_SLOTS);
 
 /// The slots to make of a view heap of `count` title and dynamic slots: with
 /// those of [`crate::memory`] after them, and enough that shaders' indices,
@@ -553,8 +554,10 @@ impl HostHeap {
             }
         };
         let make = |count: u32| {
+            // Every sampler heap is made whole: shaders keep sampler indices
+            // below its size, and slots past the title's stay null.
             if sampler {
-                return create(count);
+                return create(SAMPLERS);
             }
             // A host with room for fewer slots gets no padding.
             let slots = view_slots(count);
@@ -629,9 +632,12 @@ impl HostHeap {
         tracing::info!(count, extra, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        // The whole heap, padding included: a slot past the title's is not past the heap.
+        // SAFETY: a plain call on a live heap.
+        let whole = unsafe { heap.GetDesc() }.NumDescriptors;
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(whole) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -3076,6 +3082,9 @@ void main() {
         };
         assert_eq!(heap.count(), 16);
         assert_eq!(heap.dynamic(1), None);
+        // Made whole all the same: shaders keep sampler indices below 2048.
+        // SAFETY: a plain call on a live heap.
+        assert_eq!(unsafe { heap.heap.GetDesc() }.NumDescriptors, SAMPLERS);
     }
 
     /// A structured view whose start in its host copy is not on an element

@@ -434,8 +434,9 @@ impl Shader {
         props: (u32, u32),
     ) -> V {
         // An index past the heap is a fault that stops the host GPU.
-        let index = if !sampler && super::limits_indices() {
-            let last = self.m.i32(super::OWN_SLOTS - 1);
+        let index = if super::limits_indices() {
+            let last = if sampler { super::SAMPLER_SLOTS } else { super::OWN_SLOTS };
+            let last = self.m.i32(last - 1);
             let i32t = self.t.i32;
             self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
         } else {
