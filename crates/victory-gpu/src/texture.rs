@@ -289,8 +289,10 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if !self.not_watched.load(Ordering::Relaxed) {
-            if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-                if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            if let Some((now, newer)) =
+                crate::watch::written_since(start, start + size, false, last.asked)
+            {
+                if last.asked != 0 && !newer {
                     return (0, false);
                 }
                 last.asked = now;

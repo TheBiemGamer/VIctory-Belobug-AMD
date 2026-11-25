@@ -116,11 +116,48 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let (now, journal) = ask(start, end, guarded)?;
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    Some((
+        now,
+        journal
+            .written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    ))
+}
+
+/// [`writes`] for a caller that only wants to know whether a page of the
+/// range was last written by an asking after `since`: no list is made, and
+/// the look stops at the first such page.
+pub(crate) fn written_since(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    since: u64,
+) -> Option<(u64, bool)> {
+    let (now, journal) = ask(start, end, guarded)?;
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    Some((
+        now,
+        journal.written.range(first..last).any(|(_, &w)| w > since),
+    ))
+}
+
+/// The asking behind [`writes`]: notes the pages the kernel (or the guards)
+/// report written in the journal, and gives this asking's number with the
+/// journal, still locked, for the caller to look in.
+fn ask(
+    start: usize,
+    end: usize,
+    guarded: bool,
+) -> Option<(u64, std::sync::MutexGuard<'static, Journal>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *journal;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
@@ -155,16 +192,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     j.asked += 1;
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for page in pages {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, journal))
 }
 
 /// Same as [`writes`] for memory already known to be guarded `MEM_MAPPED`
@@ -1028,6 +1059,11 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
+        // The same answer without the list: newer than the asking before it, not than it.
+        let (_, newer) = written_since(start, end, false, now - 1).expect("watched");
+        assert!(newer);
+        let (_, newer) = written_since(start, end, false, now).expect("watched");
+        assert!(!newer);
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
