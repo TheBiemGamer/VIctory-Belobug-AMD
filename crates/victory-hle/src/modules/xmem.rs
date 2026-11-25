@@ -395,26 +395,49 @@ struct Slice {
     index: usize,
 }
 
-/// One section's views: by address (first page shown, pages), and by first
-/// page shown, so a write to some pages finds its views without a walk of all.
+/// One section's views: by address (first page shown, pages); the short ones also by
+/// first page shown, so a write to some pages finds its views without a walk of all.
 #[derive(Default)]
 struct SectionViews {
     by_addr: BTreeMap<usize, (usize, usize)>,
+    /// Views of at most [`SHORT_VIEW`] pages: (first page, address).
     by_page: std::collections::BTreeSet<(usize, usize)>,
-    /// The most pages any view has shown (never lowered).
-    longest: usize,
+    /// The longer ones (whole reservations shown at once): looked at one by one.
+    long: BTreeMap<usize, (usize, usize)>,
 }
 
+const SHORT_VIEW: usize = 16;
+
 impl SectionViews {
+    fn insert(&mut self, at: usize, (first, pages): (usize, usize)) {
+        self.by_addr.insert(at, (first, pages));
+        if pages <= SHORT_VIEW {
+            self.by_page.insert((first, at));
+        } else {
+            self.long.insert(at, (first, pages));
+        }
+    }
+
+    fn remove(&mut self, at: usize) {
+        if let Some((first, _)) = self.by_addr.remove(&at) {
+            self.by_page.remove(&(first, at));
+            self.long.remove(&at);
+        }
+    }
+
     /// Views showing some of pages `[from, to)`: address, first page, pages.
     fn showing(&self, from: usize, to: usize) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
-        let low = from.saturating_sub(self.longest.saturating_sub(1));
-        self.by_page
-            .range((low, 0)..(to, 0))
-            .filter_map(move |&(first, base)| {
-                let pages = self.by_addr.get(&base)?.1;
-                (from < first + pages).then_some((base, first, pages))
-            })
+        let low = from.saturating_sub(SHORT_VIEW - 1);
+        let short = self.by_page.range((low, 0)..(to, 0)).filter_map(move |&(first, base)| {
+            let pages = self.by_addr.get(&base)?.1;
+            (from < first + pages).then_some((base, first, pages))
+        });
+        let long = self
+            .long
+            .iter()
+            .filter(move |&(_, &(first, pages))| first < to && from < first + pages)
+            .map(|(&base, &(first, pages))| (base, first, pages));
+        short.chain(long)
     }
 }
 
@@ -451,9 +474,7 @@ impl Physical {
         let section = Arc::as_ptr(&slice.section) as usize;
         let shown = (slice.index, len / PAGE);
         let views = self.section_views.entry(section).or_default();
-        views.by_addr.insert(at, shown);
-        views.by_page.insert((shown.0, at));
-        views.longest = views.longest.max(shown.1);
+        views.insert(at, shown);
         self.views.insert(at, (len, slice));
     }
 
@@ -465,9 +486,7 @@ impl Physical {
 
     fn forget_view(&mut self, at: usize, section: usize) {
         if let Some(views) = self.section_views.get_mut(&section) {
-            if let Some((first, _)) = views.by_addr.remove(&at) {
-                views.by_page.remove(&(first, at));
-            }
+            views.remove(at);
             if views.by_addr.is_empty() {
                 self.section_views.remove(&section);
             }
