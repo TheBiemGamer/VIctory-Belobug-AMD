@@ -131,7 +131,8 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
         return out;
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
+    let mut at = start as usize;
+    let end = at.saturating_add(size as usize).min(bytes.len());
     while at + 8 <= end {
         let (Some(page), Some(block)) =
             (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
@@ -139,19 +140,22 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
             break;
         };
         let block = block as usize;
-        if block < 8 || at + block > end {
+        let Some(block_end) = at.checked_add(block).filter(|&next| block >= 8 && next <= end)
+        else {
             break;
-        }
-        for entry in (at + 8..at + block).step_by(2) {
+        };
+        for entry in (at + 8..block_end).step_by(2) {
             let Some(e) = bytes.get(entry..entry + 2) else {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+            if e >> 12 == DIR64
+                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+            {
+                out.push((entry, target));
             }
         }
-        at += block;
+        at = block_end;
     }
     out
 }
@@ -279,5 +283,49 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    #[test]
+    fn dir64_relocations_finds_the_test_binarys_entries() {
+        let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let info = ImageInfo::parse(&bytes).unwrap();
+        let found = dir64_relocations(&bytes, &info);
+        assert!(
+            !found.is_empty(),
+            "the prepared test executable has DIR64 relocations"
+        );
+        for &(entry, rva) in &found {
+            // SAFETY: an entry the function returned from the file bytes.
+            let e = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
+            assert_eq!(e >> 12, 10, "only DIR64 entries are returned");
+            assert_eq!(rva & 0xFFF, u32::from(e & 0xFFF), "the page offset is kept");
+            assert!(rva < info.size_of_image);
+        }
+    }
+
+    /// A garbage BASERELOC size or page+RVA must not wrap or read past the
+    /// file (upstream #2418).
+    #[test]
+    fn dir64_relocations_clamps_oversized_directory_and_overflowing_pages() {
+        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let info = ImageInfo::parse(&original).unwrap();
+        if let Some(d) = layout::data_directory_offset(&original, dir::BASERELOC) {
+            let mut bytes = original.clone();
+            write_u32(&mut bytes, d + 4, u32::MAX).unwrap();
+            let _ = dir64_relocations(&bytes, &info);
+
+            if let Some(rva) = layout::read_u32(&bytes, d)
+                && let Some(start) = info.rva_to_file_offset(rva)
+            {
+                let start = start as usize;
+                if start + 10 <= bytes.len() {
+                    write_u32(&mut bytes, start, u32::MAX).unwrap();
+                    write_u32(&mut bytes, start + 4, 10).unwrap();
+                    write_u16(&mut bytes, start + 8, (10 << 12) | 0x10).unwrap();
+                    write_u32(&mut bytes, d + 4, 10).unwrap();
+                    assert!(dir64_relocations(&bytes, &info).is_empty());
+                }
+            }
+        }
     }
 }
