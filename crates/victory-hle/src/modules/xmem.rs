@@ -11,7 +11,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -459,8 +459,10 @@ struct Physical {
     bound: std::collections::HashSet<usize>,
 }
 
-static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
-    Mutex::new(Physical {
+// Read-write: DirectStorage's workers only look pages and views up, and as a mutex they
+// queued behind one another (25.9 s blocked in 3 s of the world, run 4 trace).
+static PHYSICAL: LazyLock<RwLock<Physical>> = LazyLock::new(|| {
+    RwLock::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
         next_page: 0x10_0000,
         ..Default::default()
@@ -494,8 +496,12 @@ impl Physical {
     }
 }
 
-fn physical() -> MutexGuard<'static, Physical> {
-    PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+fn physical() -> RwLockWriteGuard<'static, Physical> {
+    PHYSICAL.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn physical_read() -> RwLockReadGuard<'static, Physical> {
+    PHYSICAL.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -568,7 +574,7 @@ const FRAMES: usize = PAGE >> 12;
 /// How many of `pages` are no allocated page (diagnostics: a DirectStorage
 /// destination that could not be written).
 pub(crate) fn unknown_pages(pages: &[usize]) -> usize {
-    let physical = physical();
+    let physical = physical_read();
     pages.iter().filter(|p| !physical.pages.contains_key(p)).count()
 }
 
@@ -638,7 +644,7 @@ impl Drop for View {
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
-    let physical = physical();
+    let physical = physical_read();
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
         let slice = physical.pages.get(page)?;
@@ -683,7 +689,7 @@ pub(crate) fn physical_written(pages: &[usize], offset: usize, len: usize) {
         return;
     };
     let shown: Vec<(usize, usize)> = {
-        let physical = physical();
+        let physical = physical_read();
         let mut shown = Vec::new();
         for (slice, n) in &runs {
             let (from, to) = (slice.index, slice.index + n);
@@ -1867,7 +1873,7 @@ fn log_memory(peak: &mut usize) {
         .take(8)
         .map(|(base, n)| format!("{base:#x} {} MiB", n / MIB))
         .collect();
-    let pages = physical().pages.len() * PAGE;
+    let pages = physical_read().pages.len() * PAGE;
     tracing::info!(
         target: "victory::memory",
         "commit {} MiB (peak {} MiB): private {} MiB (title range {} MiB; by allocation: {}), \
