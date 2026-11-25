@@ -529,8 +529,9 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// [`crate::memory`].
 const DYNAMIC: u32 = (1 << 20) - NULLS;
 /// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`], also leaving the [`NULLS`].
-const DYNAMIC_CAPPED: u32 = (1 << 16) - NULLS;
+/// [`PORTABLE_VIEWS`]; the null views at `OWN_SLOTS - 3..` are past such a
+/// heap anyway, so it does not give up slots for them.
+const DYNAMIC_CAPPED: u32 = (1 << 16) - 1;
 /// Null slots after the dynamic ones: the raw buffer UAV and SRV shaders read
 /// for a heap slot by index from data without a buffer view
 /// (`NULL_BUFFER_VIEW`), and the clamp target `OWN_SLOTS - 1` (#144).
@@ -1159,7 +1160,8 @@ impl HostHeap {
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
-        self.set_stride(index, 0);
+        // As view_stride gives a constant buffer: shaders read one as raw.
+        self.set_stride(index, 4);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
