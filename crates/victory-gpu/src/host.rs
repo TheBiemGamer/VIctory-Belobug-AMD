@@ -241,6 +241,10 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
         }
+        let driver = crate::drvwatch::errors();
+        if driver > 0 {
+            text.push_str(&format!("; {driver} graphics driver entries in the system event log before"));
+        }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => text.push_str(
@@ -340,6 +344,7 @@ pub(crate) fn wait_in_flight_if_ready() {
 }
 
 fn create() -> windows::core::Result<Host> {
+    crate::drvwatch::start();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.

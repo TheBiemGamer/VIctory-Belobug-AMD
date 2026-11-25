@@ -28,6 +28,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+mod drvwatch;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;

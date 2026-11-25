@@ -86,3 +86,8 @@ a lower bound.
   `VICTORY_KEEP_RETIRED=1` frees nothing retired. If DRED still says
   "inside freed" with it set, the access was a wild one, not a late use of a
   freed object.
+- Driver errors: every build logs each display-driver entry the system
+  writes to its event log as it is written ("the graphics driver reported
+  an error"), and a device removal says how many came before it. On
+  fxceless's NVIDIA runs they came 2.7 to 55 s before every loss.
+  `VICTORY_DRIVER_WATCH=0` turns the watch off.
