@@ -1105,7 +1105,7 @@ impl SubDword {
 /// lanes, one wave, or a wave64 program on a host that runs 64 lanes; without
 /// the last the driver may pick 32-lane waves and a scalar counted in a
 /// divergent loop differs between the halves (after upstream PR #92).
-fn wants_wave_size(console_lanes: bool, one_wave: bool, native_wave64: bool, runs64: bool) -> bool {
+pub(super) fn wants_wave_size(console_lanes: bool, one_wave: bool, native_wave64: bool, runs64: bool) -> bool {
     console_lanes || one_wave || native_wave64 && runs64
 }
 
@@ -10586,17 +10586,6 @@ mod tests {
     use crate::{ShaderError, io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
-
-    /// A wave64 program keeps the console's wave on a host that runs 64
-    /// lanes; the other reasons still ask for it.
-    #[test]
-    fn a_wave64_program_keeps_its_wave_on_a_64_lane_host() {
-        assert!(super::wants_wave_size(false, false, true, true));
-        assert!(!super::wants_wave_size(false, false, true, false));
-        assert!(!super::wants_wave_size(false, false, false, true));
-        assert!(super::wants_wave_size(true, false, false, false));
-        assert!(super::wants_wave_size(false, true, false, false));
-    }
 
     /// Mesh output size as the validator counts it (53 programs were over
     /// the limit; they now fail as unsupported).

@@ -720,6 +720,17 @@ mod tests {
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
+    /// A wave64 program keeps the console's wave on a host that runs 64
+    /// lanes; the other reasons still ask for it.
+    #[test]
+    fn a_wave64_program_keeps_its_wave_on_a_64_lane_host() {
+        assert!(super::lower::wants_wave_size(false, false, true, true));
+        assert!(!super::lower::wants_wave_size(false, false, true, false));
+        assert!(!super::lower::wants_wave_size(false, false, false, true));
+        assert!(super::lower::wants_wave_size(true, false, false, false));
+        assert!(super::lower::wants_wave_size(false, true, false, false));
+    }
+
     /// A comparison through an immediate sampler with a minimum, maximum
     /// or no reduction is a comparison sampler, its filter kept.
     #[test]
