@@ -207,7 +207,6 @@ fn note_crashed(name: &str) {
     }
 }
 
-/// Whether the driver crashed making the pipeline named `name` before.
 /// Whether a fault in the driver's compiler leaves the pipeline out
 /// (`VICTORY_COMPILER_GUARD=0` turns it off, and with it the list of
 /// pipelines left out before). The guard sees a fault first, before the
@@ -220,6 +219,7 @@ fn compiler_guard() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_COMPILER_GUARD").map_or(true, |v| v.trim() != "0"))
 }
 
+/// Whether the driver crashed making the pipeline named `name` before.
 fn crashed(name: &str) -> bool {
     if !compiler_guard() {
         return false;
