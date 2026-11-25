@@ -597,7 +597,15 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
+            let ms = MeshStream {
+                ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0)),
+                // The translator emits triangles only; a library loads no
+                // mesh pipeline stored without this.
+                topology: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                ),
+            };
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
                     &host.device, &root, ms, code(1), g,
@@ -750,6 +758,12 @@ struct VertexStream {
     vs: Sub<D3D12_SHADER_BYTECODE>,
     input: Sub<D3D12_INPUT_LAYOUT_DESC>,
     strip_cut: Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>,
+    topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
+
+#[repr(C)]
+struct MeshStream {
+    ms: Sub<D3D12_SHADER_BYTECODE>,
     topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
 }
 
