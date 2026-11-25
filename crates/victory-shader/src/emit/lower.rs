@@ -6789,6 +6789,20 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// Keeps raw accesses through the root view `h` (root parameter `slot`)
+    /// inside the memory behind it: a wild index read or wrote gigabytes
+    /// past it, into whatever host memory was freed there (a page fault).
+    fn limit_root_view(&mut self, h: V, slot: u8) {
+        if !super::limits_indices() || self.s.limits.iter().any(|l| l.0 == h) {
+            return;
+        }
+        // A dispatch's host data 1 and 2 are its first group and its threads.
+        let first = if self.s.threads.is_some() && self.s.mesh.is_none() { 3 } else { 1 };
+        let nth = first + self.s.limits.len() as u32;
+        let limit = self.host_data(nth, RootType::LIMIT, slot.into());
+        self.s.limits.push((h, limit));
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -6855,23 +6869,16 @@ impl<'a> Lower<'a> {
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         let h = self.s.root_srv_handle(rp.slot);
-                        // A draw with wild vertex numbers must not read past
-                        // the memory behind the view (a page fault).
-                        if super::limits_indices()
-                            && (self.s.threads.is_none() || self.s.mesh.is_some())
-                            && !self.s.limits.iter().any(|l| l.0 == h)
-                        {
-                            let nth = 1 + self.s.limits.len() as u32;
-                            let limit = self.host_data(nth, RootType::LIMIT, rp.slot.into());
-                            self.s.limits.push((h, limit));
-                        }
+                        self.limit_root_view(h, rp.slot);
                         Ok(h)
                     }
                     (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)
                     | (RootType::Descriptor, Some(ResourceType::Uav), 11) => {
                         // Other groups write what a builder reads.
                         let shared = self.ordered();
-                        Ok(self.s.root_uav_handle(rp.slot, shared))
+                        let h = self.s.root_uav_handle(rp.slot, shared);
+                        self.limit_root_view(h, rp.slot);
+                        Ok(h)
                     }
                     _ => Err("a root UAV or typed root view"),
                 }

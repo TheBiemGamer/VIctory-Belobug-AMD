@@ -932,3 +932,35 @@ fn one_wave_lds_wave_size_policy() {
     // Multi-thread LDS shader on an unconstrained target (lanes_min = 4 < 8): keeps WaveSize(32).
     assert_eq!(psv_wave_min(&lds_body, 8, super::Target::ANY), 32);
 }
+
+/// A dispatch's loads and stores through root views are kept inside the
+/// memory behind them too: each view takes its limit as host data, past the
+/// dispatch's own first group (1) and threads (2).
+#[test]
+fn dispatches_limit_their_root_views() {
+    super::LIMITS_IN_TESTS.with(|on| on.set(true));
+    let load = [0xE030_1000, 0x8006_1400]; // buffer_load_dword v20, v0, s[24:27], 0 offen
+    let store = [0xE070_1000, 0x8006_1400]; // buffer_store_dword v20, v0, s[24:27], 0 offen
+    for (kind, access) in [(ResourceType::Srv, load), (ResourceType::Uav, store)] {
+        let mut body = vec![
+            0xBE98_0300, // s_mov_b32 s24, s0
+            0xBE99_0301, // s_mov_b32 s25, s1
+            0xBE9A_03C1, // s_mov_b32 s26, -1
+            0xBE9B_03FF,
+            0x3101_6FAC, // s_mov_b32 s27, 0x31016fac
+        ];
+        mov(&mut body, 0, 4);
+        mov(&mut body, 20, 7);
+        body.extend(access);
+        let shader = shader_with(&body, 64, Some(kind), 0).unwrap();
+        // The table's user data ends at dword 5.
+        let limits: Vec<u32> = shader
+            .user_data
+            .iter()
+            .filter(|u| u.root == RootType::LIMIT)
+            .map(|u| u.index)
+            .collect();
+        assert_eq!(limits, [5 + 3], "{kind:?}");
+    }
+    super::LIMITS_IN_TESTS.with(|on| on.set(false));
+}

@@ -177,8 +177,20 @@ pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
 
 /// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
 /// take them from title data, and one past the heap stops the host GPU.
+#[cfg(not(test))]
 fn limits_indices() -> bool {
-    !cfg!(test)
+    true
+}
+
+/// Off in tests, so fixtures keep their code, unless a test turns it on.
+#[cfg(test)]
+fn limits_indices() -> bool {
+    LIMITS_IN_TESTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static LIMITS_IN_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A translated shader and what the host binds for it.

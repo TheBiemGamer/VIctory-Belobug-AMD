@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -193,15 +193,45 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        // A raw buffer load through a limited handle.
-        const RAW_LOAD: u32 = 139;
-        if opcode == RAW_LOAD
+        // The byte offset of a raw buffer access: load, store, compare-exchange, atomic.
+        let offset = match opcode {
+            139 | 140 | 79 => Some(1),
+            78 => Some(2),
+            _ => None,
+        };
+        if let Some(k) = offset
             && let Some(&(_, limit)) = self.limits.iter().find(|l| l.0 == args[0])
         {
-            let i32t = self.t.i32;
-            let at = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[args[1], limit]);
+            // The bytes accessed: a load's or store's write mask (an unknown
+            // one counts as four dwords), an atomic's value.
+            let mask = match opcode {
+                139 => args.get(3),
+                140 => args.get(7),
+                _ => None,
+            };
+            let bytes = match mask {
+                Some(&m) => match self.m.int_value(m) {
+                    Some(k @ (1 | 3 | 7)) => 4 * (k.count_ones()),
+                    _ => 16,
+                },
+                None if ret == self.t.i32 => 4,
+                None => 8,
+            };
+            // Through a limited handle (`limit` is 16 to 19 bytes before the
+            // memory's end, or 0 for a shorter copy), an offset where the access is not whole is wild
+            // and goes to `limit`, a 64-bit atomic's to `limit` rounded down to
+            // 8; those before it, the memory's last 16 bytes included, stay.
+            let edge = self.m.i32(16 - bytes);
+            let edge = self.m.bin(block, Bin::Add, limit, edge);
+            let past = self.m.cmp(block, pred::IUGT, args[k], edge);
+            let to = if bytes == 8 && matches!(opcode, 78 | 79) {
+                let eight = self.m.i32(!7);
+                self.m.bin(block, Bin::And, limit, eight)
+            } else {
+                limit
+            };
             let mut args = args.to_vec();
-            args[1] = at;
+            args[k] = self.m.select(block, past, to, args[k]);
             return self.op_as_is(block, name, attr, ret, opcode, &args);
         }
         self.op_as_is(block, name, attr, ret, opcode, args)
