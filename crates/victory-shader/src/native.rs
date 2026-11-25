@@ -813,7 +813,12 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             vgpr: e[3],
         })
         .collect();
-    let outputs = semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+    let outputs = vs_outputs(data)?;
+    Ok(StageIo::Vs { inputs, outputs })
+}
+
+fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
         .as_chunks::<6>()
         .0
         .iter()
@@ -824,8 +829,7 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             fp16: e[5] & 1 != 0,
             pack2: e[5] & 2 != 0,
         })
-        .collect();
-    Ok(StageIo::Vs { inputs, outputs })
+        .collect())
 }
 
 /// Raising loads a vertex input's channel `c` from `v[vgpr + c]`, an 8-bit
@@ -844,9 +848,8 @@ fn vs_inputs_fit(io: StageIo) -> Result<StageIo, ShaderError> {
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
-    let StageIo::Vs { outputs, .. } = vs_io(data)? else {
-        unreachable!()
-    };
+    // Mesh stage data has no vertex inputs: what lies in their count's place is not read.
+    let outputs = vs_outputs(data)?;
     let info = data
         .get(MS_INFO..MS_INFO + 8)
         .ok_or(Malformed("stage data out of bounds"))?;
@@ -1155,6 +1158,15 @@ mod tests {
                 lds_bytes: 16,
             })
         );
+    }
+
+    #[test]
+    fn mesh_stage_io_ignores_unused_vs_input_count() {
+        let mut blob = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Ms);
+        blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert!(matches!(p.io, StageIo::Ms(_)));
     }
 
     #[test]
