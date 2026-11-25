@@ -205,10 +205,10 @@ pub(crate) fn forget(resource: usize) {
 
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
-pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
-    // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+pub(crate) fn title_written(resource: This) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    crate::resource::host_texture_of(resource)
+        .is_some_and(|h| h.flags & TARGET_DEPTH_UNORDERED == 0)
 }
 
 /// Textures a bindless slot began to view, to upload before anything of the
@@ -764,6 +764,7 @@ mod tests {
             written: Default::default(),
             twin: Default::default(),
             texture: resource.unwrap(),
+            flags: 0,
             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
             bytes: 0,
         });

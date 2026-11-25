@@ -1957,7 +1957,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             if let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && crate::texture::title_written(*resource as This)
             {
                 crate::texture::upload(list, *resource as This, t);
             }

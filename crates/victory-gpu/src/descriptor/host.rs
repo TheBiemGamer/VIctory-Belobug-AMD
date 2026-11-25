@@ -1502,8 +1502,7 @@ impl HostHeap {
             let Some(host_tex) = crate::resource::host_resource(texture) else {
                 continue;
             };
-            if crate::texture::title_written(host_tex) && self.upload_due(texture, host_tex, frame)
-            {
+            if crate::texture::title_written(texture) && self.upload_due(texture, host_tex, frame) {
                 crate::texture::upload_first(texture, host_tex);
                 crate::texture::upload(list, texture, host_tex);
             }
@@ -1903,7 +1902,7 @@ impl HostHeap {
                     && let Some(host_tex) =
                         crate::resource::host_resource(tex_res as crate::object::This)
                 {
-                    if crate::texture::title_written(host_tex) {
+                    if crate::texture::title_written(tex_res as crate::object::This) {
                         crate::texture::upload_first(tex_res as crate::object::This, host_tex);
                     }
                     self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());

@@ -840,6 +840,9 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    /// Its resource flags, which never change: read once, not by a query on
+    /// every use.
+    pub(crate) flags: u32,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// What the driver allocates for it (counted in [`crate::memstat`]).
     pub(crate) bytes: u64,
@@ -1101,6 +1104,15 @@ pub(crate) fn depth_twin<'a>(this: This) -> Option<&'a crate::twin::Twin> {
     }
     let host = r.host.as_deref()?;
     host.twin.get_or_init(|| crate::twin::make(&host.texture)).as_ref()
+}
+
+/// A title texture's host copy, without sharing it.
+#[cfg(windows)]
+pub(crate) fn host_texture_of<'a>(this: This) -> Option<&'a std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    resource(this).host.as_ref()
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1418,6 +1430,8 @@ fn hand_out_resource(
             } else {
                 crate::host::legal_state(&texture, crate::host::texture_state(state))
             };
+            // SAFETY: a plain query.
+            let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
             let bytes = allocation_bytes(&texture);
             crate::memstat::add(&crate::memstat::HOST_TEXTURES, bytes);
             crate::memstat::add(&crate::memstat::HOST_TEXTURE_COUNT, 1);
@@ -1425,6 +1439,7 @@ fn hand_out_resource(
             census(&texture, bytes as i64);
             std::sync::Arc::new(HostTexture {
                 texture,
+                flags,
                 bytes,
                 slot,
                 skip,
