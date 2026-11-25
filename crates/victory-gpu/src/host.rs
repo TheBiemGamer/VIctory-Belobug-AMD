@@ -127,7 +127,7 @@ static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// the host runs at 1-2 fps).
 const KEEP_FRAMES: u64 = 32;
 
-/// A retired object, dropped on whatever thread finishes the submission.
+/// A retired object, dropped on the `victory-release` thread.
 struct Retired {
     /// The submission count it waits for.
     submission: u64,
@@ -152,8 +152,8 @@ pub(crate) fn retire<T: 'static>(object: T) {
     });
 }
 
-/// Drops what waited for submissions up to `finished` and is old enough
-/// in presented frames.
+/// Sends what waited for submissions up to `finished` and is old enough
+/// in presented frames to the release thread.
 fn bury(finished: u64) {
     // Diagnostics (`VICTORY_KEEP_RETIRED`): nothing is freed, to tell a use
     // after free from a wild address.
@@ -172,7 +172,26 @@ fn bury(finished: u64) {
             .count();
         retired.drain(..n).collect()
     };
-    drop(done);
+    if !done.is_empty() {
+        release_later(Box::new(done));
+    }
+}
+
+/// Drops `what` on a thread of its own: releasing a D3D12 resource is a
+/// kernel call (upstream measured ~5 % of the submitting thread). Only for
+/// objects no GPU work in flight uses.
+fn release_later(what: Box<dyn std::any::Any + Send>) {
+    type Release = std::sync::mpsc::Sender<Box<dyn std::any::Any + Send>>;
+    static RELEASE: OnceLock<Release> = OnceLock::new();
+    let release = RELEASE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn std::any::Any + Send>>();
+        // Without the thread the receiver is gone: sends fail and drop here.
+        let _ = std::thread::Builder::new()
+            .name("victory-release".into())
+            .spawn(move || rx.into_iter().for_each(drop));
+        tx
+    });
+    let _ = release.send(what);
 }
 
 /// Time spent in submissions since the last frame-rate line, in
