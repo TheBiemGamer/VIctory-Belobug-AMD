@@ -132,6 +132,8 @@ pub(crate) struct Host {
     presenter: Mutex<Option<Presenter>>,
     /// Device-local VRAM card buffer engine (Wave64 GPU page hashing), lazily initialized.
     card: OnceLock<Option<Mutex<crate::card::CardEngine>>>,
+    /// The texture detiling pipeline (`VICTORY_GPU_DETILE`), made on first use.
+    detile: OnceLock<Option<std::sync::Arc<crate::detile::Detiler>>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -531,6 +533,7 @@ impl Host {
                 next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
                 card: OnceLock::new(),
+                detile: OnceLock::new(),
             })
         }
     }
@@ -551,6 +554,18 @@ impl Host {
                 }
             })
             .as_ref()
+    }
+
+    pub(crate) fn detiler(&self) -> Option<std::sync::Arc<crate::detile::Detiler>> {
+        self.detile
+            .get_or_init(|| match crate::detile::Detiler::new(self) {
+                Ok(detiler) => Some(std::sync::Arc::new(detiler)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no GPU texture detiling; detiling on the CPU");
+                    None
+                }
+            })
+            .clone()
     }
 
     pub(crate) fn card_ready(&self) -> bool {
@@ -587,6 +602,18 @@ impl Host {
         // SAFETY: `adapter` is a verified software WARP adapter.
         unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()? };
         Host::from_device(device?, None).ok()
+    }
+
+    /// As [`Host::new_warp`], on the fastest hardware adapter when there is one.
+    #[cfg(test)]
+    pub(crate) fn new_hardware_or_warp() -> Option<Host> {
+        let hardware = fastest_adapter().ok().and_then(|adapter| {
+            let mut device: Option<ID3D12Device> = None;
+            // SAFETY: a live adapter and an out pointer.
+            unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()? };
+            Host::from_device(device?, None).ok()
+        });
+        hardware.or_else(Host::new_warp)
     }
 }
 
