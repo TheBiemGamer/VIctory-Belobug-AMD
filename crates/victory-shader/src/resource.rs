@@ -226,6 +226,8 @@ pub fn track_with(
                         descriptor(s, Role::Sampler)?;
                     }
                 }
+                // A cache invalidation reads nothing through its descriptor.
+                Fields::Buffer { .. } if inst.name().ends_with("_inv") => {}
                 Fields::Buffer { rsrc, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     // Per-lane descriptors may be fetched from a buffer over

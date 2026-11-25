@@ -1115,10 +1115,7 @@ impl<'a> Lower<'a> {
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let dead = crate::sgpr_spill::dead(p);
-        let writes_uavs = insts().any(|i| {
-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
-                && (i.name().contains("store") || i.name().contains("atomic"))
-        });
+        let writes_uavs = insts().any(writes_uav);
         let wide_lds =
             insts().any(|i| ds_integer_atomic(i.name()).is_some_and(|(_, wide, _)| wide));
         let mut console_lanes = false;
@@ -8667,6 +8664,14 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        // Cache invalidations: the console's acquire after an atomic or flag (the
+        // waits are dropped, and most UAVs are not globally coherent), so a fence.
+        if matches!(name, "buffer_gl0_inv" | "buffer_gl1_inv") {
+            if self.writes_uavs {
+                self.uav_fence();
+            }
+            return Ok(());
+        }
         if *lds || *tfe {
             return Err("a buffer access to LDS or with tfe");
         }
@@ -10195,6 +10200,18 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Whether `i` writes memory through a view: a buffer, image or global store
+/// or atomic (scratch is the lane's own).
+fn writes_uav(i: &Inst) -> bool {
+    let name = i.name();
+    let writes = name.contains("store") || name.contains("atomic");
+    match i.fields {
+        Fields::Image { .. } | Fields::Buffer { .. } => writes,
+        Fields::Flat { .. } => writes && name.starts_with("global_"),
+        _ => false,
+    }
+}
+
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
 /// pull model).
 /// The host's limit on a mesh shader's vertex plus primitive outputs
@@ -10427,6 +10444,42 @@ mod tests {
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
         lower_with(words, vec![], vec![]).map(|_| ())
+    }
+
+    #[test]
+    fn global_stores_and_atomics_write_uavs_scratch_does_not() {
+        let code: Vec<u8> = [
+            0xDC70_8000, 0x007D_0200, // global_store_dword v0, v2, off
+            0xDCC8_8000, 0x007D_0200, // global_atomic_add v0, v2, off
+            0xDC30_8000, 0x017D_0000, // global_load_dword v1, v0, off
+            0xDC70_4000, 0x007D_0200, // scratch_store_dword v0, v2, off
+            0xE070_0000, 0x8001_0100, // buffer_store_dword v1, v0, s[4:7], 0
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let writes: Vec<(&str, bool)> =
+            p.blocks[0].insts.iter().map(|i| (i.name(), super::writes_uav(i))).collect();
+        assert_eq!(
+            writes,
+            [
+                ("global_store_dword", true),
+                ("global_atomic_add", true),
+                ("global_load_dword", false),
+                ("scratch_store_dword", false),
+                ("buffer_store_dword", true),
+                ("s_endpgm", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn buffer_cache_invalidations_lower_as_no_ops() {
+        // MUBUF opcodes 0x71 and 0x72, with no data operand.
+        assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM]).is_ok(), "buffer_gl0_inv");
+        assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM]).is_ok(), "buffer_gl1_inv");
     }
 
     /// [`lowers`] with the input registers `rsrc2` names.

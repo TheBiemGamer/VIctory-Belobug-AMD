@@ -964,3 +964,17 @@ fn dispatches_limit_their_root_views() {
     }
     super::LIMITS_IN_TESTS.with(|on| on.set(false));
 }
+
+/// A cache invalidation after a UAV write is the console's acquire: it is
+/// lowered to a device-wide UAV fence, not to nothing.
+#[test]
+fn a_cache_invalidation_in_a_program_with_uavs_fences() {
+    let mut body = Vec::new();
+    mov(&mut body, 0, 0);
+    mov(&mut body, 1, 7);
+    body.extend(buf(0x1C, 0, 1, 0)); // buffer_store_dword v1, v0, s[8:11]
+    let without = shader(&body, 64).unwrap().dxil;
+    body.extend([0xE1C8_0000, 0]); // buffer_gl1_inv
+    let with = shader(&body, 64).unwrap().dxil;
+    assert_ne!(with, without);
+}

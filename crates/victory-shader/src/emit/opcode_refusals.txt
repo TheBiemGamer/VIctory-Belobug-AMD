@@ -21,8 +21,6 @@ buffer_atomic_swap_x2
 buffer_atomic_umax_x2
 buffer_atomic_umin_x2
 buffer_atomic_xor_x2
-buffer_gl0_inv
-buffer_gl1_inv
 buffer_load_format_d16_hi_x
 buffer_load_sbyte
 buffer_load_sbyte_d16
