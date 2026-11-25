@@ -26,6 +26,9 @@ pub(crate) struct HostHeap {
     /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap,
     /// [`SAMPLER_DYNAMIC`] in a capped sampler heap, none in another.
     spare: u32,
+    /// First slot of memory-by-address views: the heap's last
+    /// [`crate::memory::SLOTS`].
+    memory_first: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -77,9 +80,11 @@ struct StrideTable {
 
 impl StrideTable {
     /// The element counts follow the strides, from [`COUNTS_AT`] dwords on
-    /// (where shaders, which know no heap's size, look for them).
+    /// (where shaders, which know no heap's size, look for them). Both halves
+    /// cover at least `COUNTS_AT` slots: shaders clamp a slot to
+    /// `COUNTS_AT - 1`, and a root SRV read past the buffer faults (after #144).
     fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = ((u64::from(COUNTS_AT) + u64::from(len)) * 4).max(4);
+        let bytes = ((u64::from(COUNTS_AT) + u64::from(len.max(COUNTS_AT))) * 4).max(4);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -520,22 +525,25 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// frame of some 7,000 draws held over 400,000 of 2^19, and tables of 150
 /// slots no longer fit: the draws that needed them were dropped (the
 /// subsurface resolve, tree imposters). `victory_shader::emit::VIEW_SLOTS`
-/// is the title's 1,245,184 slots, these and those of [`crate::memory`].
-const DYNAMIC: u32 = 1 << 20;
+/// is the title's 1,245,184 slots, these, one null slot and those of
+/// [`crate::memory`]. The null slot is the one shaders clamp a wild index to
+/// (`OWN_SLOTS - 1`): a live dynamic slot there was read as anything (#144).
+const DYNAMIC: u32 = (1 << 20) - 1;
 /// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
+/// [`PORTABLE_VIEWS`], also leaving one null slot.
+const DYNAMIC_CAPPED: u32 = (1 << 16) - 1;
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
 const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
 const _: () = assert!(SAMPLERS == victory_shader::emit::SAMPLER_SLOTS);
 
-/// The slots to make of a view heap of `count` title and dynamic slots: with
-/// those of [`crate::memory`] after them, and enough that shaders' indices,
-/// which stay below [`victory_shader::emit::VIEW_SLOTS`], are inside it.
+/// The slots to make of a view heap of `count` title and dynamic slots: one
+/// null slot and those of [`crate::memory`] after them, and enough that
+/// shaders' indices, which stay below [`victory_shader::emit::VIEW_SLOTS`],
+/// are inside it.
 fn view_slots(count: u32) -> u32 {
-    let slots = count + crate::memory::SLOTS;
+    let slots = count + 1 + crate::memory::SLOTS;
     if cfg!(test) { slots } else { slots.max(victory_shader::emit::VIEW_SLOTS) }
 }
 
@@ -668,7 +676,7 @@ impl HostHeap {
             }
             // A host with room for fewer slots gets no padding.
             let slots = view_slots(count);
-            create(slots).or_else(|_| create(count + crate::memory::SLOTS))
+            create(slots).or_else(|_| create(count + 1 + crate::memory::SLOTS))
         };
         if sampler && count > SAMPLERS {
             // shortcut: samplers past the host's limit are left out; tables
@@ -693,8 +701,8 @@ impl HostHeap {
         let wanted = count;
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
-            Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
-                let most = PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS;
+            Err(e) if !sampler && count + extra + 1 + crate::memory::SLOTS > PORTABLE_VIEWS => {
+                let most = PORTABLE_VIEWS - DYNAMIC_CAPPED - 1 - crate::memory::SLOTS;
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
                 tracing::warn!(
@@ -705,7 +713,7 @@ impl HostHeap {
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
-                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
+                    create(PORTABLE_VIEWS).ok()?,
                     // Never more title slots than were asked for.
                     wanted.min(most),
                     DYNAMIC_CAPPED,
@@ -753,12 +761,15 @@ impl HostHeap {
         } else {
             StrideTable::new(&host.device, count + extra)
         };
+        // Memory views end the heap, past its padding and the null slot.
+        let memory_first = if sampler { whole } else { whole.saturating_sub(crate::memory::SLOTS) };
         let h = HostHeap {
             heap,
             cpu,
             step,
             count,
             spare: extra,
+            memory_first,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
@@ -792,7 +803,7 @@ impl HostHeap {
 
     /// The first slot of memory by address, its views made.
     pub(crate) fn memory(&self) -> u32 {
-        let first = self.count + self.spare;
+        let first = self.memory_first;
         if let Some(host) = host() {
             let mut seen = self.memory_seen.lock().unwrap_or_else(|e| e.into_inner());
             *seen = crate::memory::fill(&host.device, *seen, |k| self.cpu(first + k));
