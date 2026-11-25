@@ -91,7 +91,21 @@ fn append_to_file(file: &std::path::Path, text: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let entry = format!("unix time {now}, process {}\n{text}\n", std::process::id());
-    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Not a plain lock: a crash on the thread holding it (while it reports
+    // another) would hang here; after ~100 ms it writes without the lock.
+    let mut guard = None;
+    for _ in 0..100 {
+        match LOG_LOCK.try_lock() {
+            Ok(g) => guard = Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => guard = Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+        }
+        break;
+    }
+    let _guard = guard;
     let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
     if let Ok(mut f) = opened {
         let _ = f.write_all(entry.as_bytes());

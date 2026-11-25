@@ -1405,11 +1405,8 @@ pub(crate) fn remapped(start: u64, end: u64) {
     use windows::core::Interface;
     filled(start, end);
     crate::memory::remapped(start, end);
-    EXACT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .1
-        .retain(|&(addr, len), _| addr >= end || addr.saturating_add(len) <= start);
+    // Own copies (EXACT) stay: a slot made on one keeps it, and like a shared
+    // copy it gets the new contents at its next refresh.
     let mut map = windows_of_memory();
     if map.is_empty() {
         return;
@@ -3107,7 +3104,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_cache_reuses_prunes_idle_and_drops_on_remap() {
+    fn exact_cache_reuses_prunes_idle_and_keeps_copies_on_remap() {
         assert!(exact(0x1000, 0).is_none());
         let Some(host) = crate::host::host() else {
             return;
@@ -3117,10 +3114,10 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &a2));
         drop(a2);
         let b = exact(0x8_0001_0000, 128).unwrap();
-        // Overlapping remap evicts `a` while leaving disjoint `b`.
+        // A remap keeps the copies: a slot made on one must not be left on an old one.
         remapped(0x8_0000_0000, 0x8_0000_0200);
         let a3 = exact(0x8_0000_0040, 128).unwrap();
-        assert!(!Arc::ptr_eq(&a, &a3));
+        assert!(Arc::ptr_eq(&a, &a3));
         assert!(Arc::ptr_eq(&b, &exact(0x8_0001_0000, 128).unwrap()));
 
         // Exercise all four retention conditions in `prune_exact`.
@@ -3157,6 +3154,5 @@ mod tests {
         drop(active);
         drop(newest);
         drop(fresh);
-        remapped(0x8_0000_0000, 0x8_0006_0000);
     }
 }
