@@ -60,10 +60,14 @@ struct Finish {
 unsafe impl Send for Finish {}
 
 /// Whether the title's submissions may return before the host GPU is done
-/// (`VICTORY_ASYNC_SUBMIT=1`; off by default).
+/// (`VICTORY_ASYNC_SUBMIT=0` turns it off). At the stilt house with 8,400
+/// draws a frame it is 150-186 ms a frame against 200-238 (run as5 against
+/// rw1, 2026-11-25): the wait for the host GPU goes from 78-95 to 4-17 ms.
+/// It gained nothing while the title's recording threads took turns on the
+/// views table's mutex.
 fn async_submit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_none_or(|v| v != "0"))
 }
 
 /// Microseconds spent bringing buffer copies up to date while the
@@ -127,12 +131,23 @@ static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// the host runs at 1-2 fps).
 const KEEP_FRAMES: u64 = 32;
 
+/// And the time a retired object is kept for at least: in the menus 32
+/// frames are a third of a second, and lists recorded ahead, or descriptors
+/// the title left in a heap, named copies freed by then (with
+/// `VICTORY_RAYS=1`: page faults inside destroyed 4 and 10.78 MiB buffers,
+/// Radeon GPU Detective, runs rt2 and rt6; with nothing freed the run went
+/// on into the world, rt3).
+/// shortcut: a time, not a count of what still names the object.
+const KEEP_TIME: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// A retired object, dropped on the `victory-release` thread.
 struct Retired {
     /// The submission count it waits for.
     submission: u64,
     /// The presented frame it was retired in.
     frame: u64,
+    /// When.
+    at: std::time::Instant,
     #[allow(dead_code)]
     object: Box<dyn std::any::Any>,
 }
@@ -148,6 +163,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back(Retired {
         submission,
         frame,
+        at: std::time::Instant::now(),
         object: Box::new(object),
     });
 }
@@ -167,7 +183,9 @@ fn bury(finished: u64) {
         let n = retired
             .iter()
             .take_while(|r| {
-                r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
+                r.submission <= finished
+                    && now.saturating_sub(r.frame) >= KEEP_FRAMES
+                    && r.at.elapsed() >= KEEP_TIME
             })
             .count();
         retired.drain(..n).collect()
@@ -1004,9 +1022,15 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The host pipelines `bind_pipeline` kept (by address), so a pipeline
+    /// the list binds again is not kept again.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Buffer ranges declared written by shaders since the last title copy
+    /// (host copy, address, bytes): declaring them again would change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Upload memory filled from title memory since the last title write
     /// (source, bytes): its host address, which a second fill would find
     /// holding the same bytes.
@@ -1349,22 +1373,31 @@ impl Host {
         let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
             Vec::new();
         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut add = |shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize| {
-            if seen.insert((std::sync::Arc::as_ptr(shadow) as usize, address, len)) {
-                let target = if shadow.is_card() { &mut card_writes } else { &mut cpu_back };
-                target.push((shadow.clone(), address, len));
-            }
-        };
+        // A copy is either a card's or not, so one set of ranges serves both.
+        let mut declared = std::collections::HashSet::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step {
-                    add(shadow, *address, *len);
+                if let Step::GpuWrite(shadow, address, len) = step
+                    && declared.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
+                {
+                    let target = if shadow.is_card() {
+                        &mut card_writes
+                    } else {
+                        &mut cpu_back
+                    };
+                    target.push((shadow.clone(), *address, *len));
                 }
             }
         }
         for (shadow, address, len) in batch.bindless_writes.drain(..) {
-            add(&shadow, address, len);
+            if declared.insert((std::sync::Arc::as_ptr(&shadow) as usize, address, len)) {
+                let target = if shadow.is_card() {
+                    &mut card_writes
+                } else {
+                    &mut cpu_back
+                };
+                target.push((shadow, address, len));
+            }
         }
         let (card_before, card_plan, mut card_after) =
             if self.card.get().and_then(|o| o.as_ref()).is_some() || !card_writes.is_empty() {
@@ -2252,12 +2285,21 @@ impl HostList {
         }
     }
 
-    /// Notes a pipeline the list binds.
-    pub(crate) fn used_pipeline(&self, name: &str) {
-        let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+    /// Notes a pipeline the list binds and keeps it and its root signature
+    /// until the list is reset, the first time only: the list keeps the
+    /// first, so its address names the same pipeline from then on.
+    pub(crate) fn bind_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
+        let mut deferred = self.deferred();
+        if !deferred.bound.insert(p.pso.as_raw() as usize) {
+            return;
         }
+        deferred.kept.push(p.pso.clone().into());
+        deferred.kept.push(p.root.clone().into());
+        drop(deferred);
+        self.pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(p.name.clone());
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -2271,6 +2313,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
         deferred.filled.clear();
     }
 
@@ -2323,9 +2366,13 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A wait for a memory value.
@@ -2667,6 +2714,7 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
         deferred.filled.clear();
     }
 
@@ -3596,6 +3644,44 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// One render target view, for the back buffer the readout is drawn on.
+    rtv: ID3D12DescriptorHeap,
+}
+
+impl Presenter {
+    /// Writes the frame rate and frame time in the top left corner of
+    /// `back`, which is a render target on `list`.
+    ///
+    /// # Safety
+    /// `back` is this swap chain's buffer, in the render target state.
+    unsafe fn readout(&self, device: &ID3D12Device, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource) {
+        let Some((fps, ms)) = self.meter.shown else { return };
+        if !crate::readout::on() {
+            return;
+        }
+        let text = format!("{fps:.1} FPS  {ms:.0} MS");
+        // Dots that keep their share of the picture at any size.
+        let dot = (self.height as i32 / 216).max(2);
+        let at = (dot * 3, dot * 3);
+        let (w, h) = crate::readout::size(&text);
+        let behind = RECT {
+            left: at.0,
+            top: at.1,
+            right: at.0 + w * dot,
+            bottom: at.1 + h * dot,
+        };
+        let marks = crate::readout::rects(&text, at, dot);
+        // SAFETY: our heap of one view, and rectangles inside the picture
+        // (a text of a few characters at this size).
+        unsafe {
+            let view = self.rtv.GetCPUDescriptorHandleForHeapStart();
+            device.CreateRenderTargetView(back, None, view);
+            if behind.right <= self.width as i32 && behind.bottom <= self.height as i32 {
+                list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
+                list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
+            }
+        }
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3607,6 +3693,8 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// The frames a second and milliseconds a frame of the last second.
+    shown: Option<(f64, f64)>,
 }
 
 impl Meter {
@@ -3618,6 +3706,7 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            shown: None,
         }
     }
 
@@ -3638,6 +3727,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        self.shown = Some((fps, ms));
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -3800,14 +3890,13 @@ impl Host {
             let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
+            let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
             list.ResourceBarrier(&[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
+                transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, target),
             ]);
+            p.readout(&self.device, list, &back);
+            list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)]);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
@@ -3878,6 +3967,7 @@ impl Host {
             }
             list.ResourceBarrier(&into);
             crate::compose::record(self, list, planes, &back, (width, height, format));
+            p.readout(&self.device, list, &back);
             #[cfg(feature = "diagnostics")]
             let capture = {
                 list.ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
@@ -3933,6 +4023,12 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
+            let rtv: ID3D12DescriptorHeap =
+                self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })?;
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
                 swap_chain,
@@ -3942,6 +4038,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                rtv,
             })
         }
     }

@@ -226,9 +226,29 @@ pub(crate) fn dispatched() -> u64 {
 fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
     let reach = if kind == 0 { 1 << 16 } else { 1 << 20 };
     let shadow = crate::shadow::find_reaching(address, reach)?;
-    let len = shadow.left(address).min(reach);
+    let mut len = shadow.left(address).min(reach);
+    // In a sparse copy only the tiles asked for are there, and a shader that
+    // reads a root view past them faults (the structure builders' views have
+    // no length: Radeon GPU Detective, run rt10, a read at an address of no
+    // resource). To the end of the title's buffer then, within reason.
+    // shortcut: 64 MiB at most; a longer buffer is cut there.
+    if kind != 0
+        && shadow.is_sparse()
+        && let Some(end) = crate::shadow::buffer_end(address)
+    {
+        len = len.max((end - address).min(64 << 20)).min(shadow.left(address));
+    }
     let gpu = shadow.gpu(address);
     if kind != 0 || gpu % 256 == 0 {
+        // The list holds the copy it gives the address of: the title may
+        // release the buffer before it submits the list, and a retired copy
+        // only outlives the submissions started by then and a few frames
+        // (menus present a hundred a second). The structure builders' lists
+        // read and wrote freed copies (page fault in a copy loop of root
+        // views, Radeon GPU Detective, run rt2, 2026-11-25).
+        if kind != 0 && list.first_use(shadow.buffer.as_raw() as usize) {
+            list.keep(&shadow.buffer);
+        }
         shadow.refresh(list, address, len);
         if kind == 2 {
             shadow.gpu_writes(list, address, len);
@@ -647,7 +667,11 @@ impl State {
     /// After a dispatch of `p`: the least indirect light, if it is the
     /// program that resolves that.
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+        else {
             return false;
         };
         let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
@@ -681,6 +705,13 @@ impl State {
                     );
                 }
             });
+        }
+        if !stage.shader.resolves_light {
+            // The reflections, held to the light around.
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => false,
+            };
         }
         let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
             Some(View::Unordered(r, ..)) => r,
@@ -745,6 +776,11 @@ impl State {
         }
         if !self.bind(list, p, false) {
             return false;
+        }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -860,10 +896,8 @@ impl State {
                 self.apply_depth_bounds(list);
             }
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(p);
         }
         if p.stages.iter().any(|s| s.translated().resource_heap)
             && self.heaps[0] != 0
@@ -1929,7 +1963,8 @@ impl State {
             list.count_write();
             list.count_work();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
-            if crate::twin::resolve(list) {
+            let lit = self.ambient(list, p);
+            if crate::twin::resolve(list) | lit {
                 self.continue_in(list);
             }
         } else {
