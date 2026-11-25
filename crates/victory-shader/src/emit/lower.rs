@@ -8940,9 +8940,12 @@ impl<'a> Lower<'a> {
             let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
             return self.write_half(inst, r, guard);
         }
-        // 16-bit integers: computed on the low halves, the low 16 bits kept.
+        // 16-bit integers: computed on the low halves, the low 16 bits
+        // kept; the per-operand neg modifier is applied here (the float
+        // paths apply it themselves), the clamp, output modifier and abs
+        // are not lowered yet.
         let saturates = matches!(name, "v_mad_i16" | "v_mad_u16");
-        if v.clamp && !saturates || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        if v.clamp && !saturates || v.omod != 0 || v.abs != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -8968,6 +8971,14 @@ impl<'a> Lower<'a> {
                 let signed = name.ends_with("_i16");
                 let read = |l: &mut Self, i| -> Result<V, Why> {
                     let x = l.half_src(inst, i)?;
+                    let x = if v.neg >> i & 1 != 0 {
+                        let z = l.s.m.i32(0);
+                        let m = l.s.m.i32(0xFFFF);
+                        let x = l.s.m.bin(c, Bin::Sub, z, x);
+                        l.s.m.bin(c, Bin::And, x, m)
+                    } else {
+                        x
+                    };
                     Ok(if signed { l.sign_extend(x, 16) } else { x })
                 };
                 let (a, b) = (read(self, 0)?, read(self, 1)?);
@@ -14388,6 +14399,37 @@ mod tests {
             per_lane_only: false,
         })
         .map(|_| ())
+    }
+
+    #[test]
+    fn a_16bit_integer_with_a_neg_modifier_lowers() {
+        // v_add_nc_u16 v0, -v1, v2 (VOP3 opcode 0x303, neg on src0)
+        lowers_valu(&[0xD703_0000, 0x2000_0401]).unwrap();
+        // The second source's neg bit is a different bit in the word.
+        lowers_valu(&[0xD703_0000, 0x4000_0401]).unwrap();
+    }
+
+    /// The 16-bit integer path takes `neg`, but must still refuse the
+    /// modifiers it does not lower yet: abs, clamp and output modifiers.
+    #[test]
+    fn a_16bit_integer_abs_clamp_and_omod_are_still_refused() {
+        let base = [0xD703_0000u32, 0x0000_0401];
+        assert!(lowers_valu(&base).is_ok(), "the unmodified form lowers");
+        // abs on src0: VOP3 w0 bit 8.
+        assert!(
+            lowers_valu(&[base[0] | 1 << 8, base[1]]).is_err(),
+            "abs must be refused"
+        );
+        // clamp: VOP3 w0 bit 15.
+        assert!(
+            lowers_valu(&[base[0] | 1 << 15, base[1]]).is_err(),
+            "clamp must be refused"
+        );
+        // omod: VOP3 w1 bits 27-28.
+        assert!(
+            lowers_valu(&[base[0], base[1] | 1 << 27]).is_err(),
+            "omod must be refused"
+        );
     }
 
     #[test]

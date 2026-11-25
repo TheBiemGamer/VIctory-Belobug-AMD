@@ -1001,6 +1001,36 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     });
 }
 
+/// `v_add_nc_u16` negates the source whose `neg` bit is set, for src0 and
+/// src1, on the hardware and through the translation.
+#[test]
+fn v_add_nc_16bit_negates_each_source() {
+    let base = vop3(0x303, 0, vgpr(1), vgpr(2), 0);
+    let inputs: &[[u32; 4]] = &[
+        [0x0001, 0x0002, 0, 0],
+        [0xFFFF, 0x0001, 0, 0],
+        [0x8000, 0x8000, 0, 0],
+        [0x1234, 0x1000, 0, 0],
+    ];
+    for &(neg_bit, want_src0) in &[(1u32 << 29, true), (1u32 << 30, false)] {
+        let mut words = base;
+        words[1] |= neg_bit;
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, inputs, |backend, i, inp, got| {
+            let (a, b) = (inp[0] as u16, inp[1] as u16);
+            let want = if want_src0 {
+                a.wrapping_neg().wrapping_add(b)
+            } else {
+                a.wrapping_add(b.wrapping_neg())
+            };
+            assert_eq!(
+                got as u16, want,
+                "{backend}: case {i}, neg {neg_bit:#x}, a={a:#06x} b={b:#06x}"
+            );
+        });
+    }
+}
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
