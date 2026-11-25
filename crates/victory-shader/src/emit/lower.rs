@@ -7057,7 +7057,7 @@ impl<'a> Lower<'a> {
             }
             // shortcut: of samplers given in the code that a branch picks one
             // of (how they treat coordinates off the texture differs), the
-            // first is taken.
+            // first is taken where `image` cannot sample with each.
             Source::Phi { args, .. }
                 if sampler
                     && let Some(arg) = args.iter().find(|a| matches!(a, Source::Constant(_))) =>
@@ -7871,7 +7871,13 @@ impl<'a> Lower<'a> {
         f
     }
 
-    fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+    fn image_with(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        sampler: Option<&'a Source>,
+    ) -> Result<(), Why> {
         let Fields::Image {
             data,
             addr,
@@ -8203,11 +8209,7 @@ impl<'a> Lower<'a> {
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
         let r = if sample {
-            let ss = self
-                .descriptors
-                .get(&(site, true))
-                .copied()
-                .ok_or("an untracked sampler")?;
+            let ss = sampler.ok_or("an untracked sampler")?;
             let f = form.unwrap_or_default();
             if f.c && dmask.count_ones() != 1 {
                 return Err("a comparison sample of several channels");

@@ -1,7 +1,7 @@
 //! Image lowerings read back through `dxc -dumpbin` (`VICTORY_PC_DXC`, else
 //! the Windows SDK's); skipped without one.
 
-use super::tests::{lower_with, root};
+use super::tests::{lower_with, root, texture_tables};
 use crate::native::{ResourceType, RootType, UsedResource};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -154,4 +154,45 @@ fn a_level_past_the_last_has_zero_sizes() {
     let dxil = lower_with(&words, layout, used).unwrap().dxil;
     let text = dump(&dxc, &dxil, "levels-msaa");
     assert!(!text.contains("icmp uge"), "{text}");
+}
+
+#[test]
+fn a_uniform_branch_can_choose_between_immediate_samplers() {
+    // A root constant picks wrap or clamp (DexNom ddb7332); an LDS store
+    // keeps the sample live.
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302, // s_load_dwordx8 s[12:19], s[4:5], 0
+        0xFA00_0000,
+        0xBE89_0380, // s_mov_b32 s9..s11, 0: sampler words 1-3
+        0xBE8A_0380,
+        0xBE8B_0380,
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0002, // s_cbranch_scc1 to the clamp
+        0xBE88_0380, // s_mov_b32 s8, 0: wrap
+        0xBF82_0002, // s_branch past the clamp
+        0xBE88_03FF, // s_mov_b32 s8, 0x92: clamp on all axes
+        0x0000_0092,
+        0xF09C_0F08, // image_sample_lz v[12:15], v[0:1], s[12:19], s[8:11]
+        0x0043_0C00,
+        0xD834_0000, // ds_write_b32 v0, v12
+        0x0000_0C00,
+        S_ENDPGM,
+    ];
+    let (mut layout, mut used) = texture_tables();
+    layout[1] = root(RootType::Constants, 1, 1);
+    used.truncate(1);
+    let shader = lower_with(&words, layout, used).unwrap();
+    assert_eq!(shader.samplers.len(), 2);
+    assert!(shader.samplers.contains(&[0, 0, 0, 0]));
+    assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
+    let Some(dxc) = dxc() else {
+        return eprintln!("no dxc; DXIL check skipped");
+    };
+    // Both samples, and per channel the one of the edge taken.
+    let text = dump(&dxc, &shader.dxil, "sampler-phi");
+    let samples = "call %dx.types.ResRet.f32 @dx.op.sampleLevel.f32(";
+    assert_eq!(text.matches(samples).count(), 2, "{text}");
+    assert!(text.contains("phi i1 [ true, "), "{text}");
 }
