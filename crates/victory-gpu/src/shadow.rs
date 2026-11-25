@@ -854,6 +854,8 @@ impl Shadow {
                 at = next;
                 continue;
             }
+            // A page lazy copy-back hides looks unmapped: put back first.
+            crate::lazy::resolve(whole.start, PAGE);
             if !(hole.contains(&whole.start) && whole.end <= hole.end) {
                 hole = match unmapped(whole.start) {
                     Some(end) => whole.start..end,
@@ -943,6 +945,9 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
+            if *at != 0 && write > *at && crate::lazy::current(self.root_key(), page * PAGE, write) {
+                *at = write;
+            }
             if *at == 0 || write > *at {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
@@ -1832,7 +1837,9 @@ pub(crate) fn sweep(frame: u64) {
         .collect();
     for shadow in all {
         let Some(s) = &shadow.sparse else { continue };
-        if !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        if !shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            || crate::lazy::holds(shadow.root_key())
+        {
             continue;
         }
         // Those old enough, taken under the lock; whether their title memory
@@ -2245,6 +2252,13 @@ impl Shadow {
         }
         let views = self.tiles_of(s, address, end);
         let start = self.start as usize;
+        // Pages lazy copy-back still owes keep their tile as the snapshot.
+        let kept: std::collections::HashSet<u32, Mix> = if crate::lazy::on() {
+            let kept = crate::lazy::declare(crate::host::started(), &views);
+            views.iter().zip(kept).filter(|(_, k)| *k).map(|(&(at, _, _), _)| ((at - start) / PAGE) as u32).collect()
+        } else {
+            Default::default()
+        };
         if compares() {
             let mut compared = s.compared.lock().unwrap_or_else(|e| e.into_inner());
             compared.marked.extend(views.iter().map(|&(at, _, _)| ((at - start) / PAGE) as u32));
@@ -2255,7 +2269,7 @@ impl Shadow {
         let new: Vec<(u32, usize)> = views
             .iter()
             .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data & !(PAGE - 1)))
-            .filter(|(tile, _)| !before.contains_key(tile))
+            .filter(|(tile, _)| !before.contains_key(tile) && !kept.contains(tile))
             .collect();
         snapshot_tiles(&mut before, &new);
     }
@@ -2342,26 +2356,40 @@ pub(crate) fn marked_tiles(back: &[(Arc<Shadow>, usize, usize)]) -> Vec<(&Shadow
 
 impl Shadow {
     /// [`Shadow::copy_back`] of a sparse copy, its tiles on several threads.
+    /// With lazy copy-back the pages the GPU changed are left owed where
+    /// they can be ([`crate::lazy`]), and merged now where not.
     fn sparse_back(&self, s: &Sparse, address: usize, len: usize, submission: u64) -> usize {
         let views = self.tiles_of(s, address, address + len);
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut compared = s.compared.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
-        // (title address, view, length, the snapshot's bytes): one tile each,
-        // so no two touch the same memory.
-        let work: Vec<(usize, usize, usize, usize)> = views
+        let lazy = crate::lazy::on();
+        // The tiles of pages owed when this submission declared them, kept then.
+        let kept = if lazy { crate::lazy::declared(submission, &views) } else { vec![None; views.len()] };
+        // (title address, view, length, the snapshot's bytes, kept by lazy
+        // copy-back): one tile each, so no two touch the same memory.
+        let work: Vec<(usize, usize, usize, usize, bool)> = views
             .iter()
-            .filter_map(|&(at, data, n)| {
+            .zip(kept)
+            .filter_map(|(&(at, data, n), kept)| {
                 let tile = ((at - start) / PAGE) as u32;
                 if let Some(old) = compared.old(tile, at % PAGE) {
-                    return old.map(|old| (at, data, n, old));
+                    return old.map(|old| (at, data, n, old, kept.is_some()));
+                }
+                if let Some(kept) = kept {
+                    return Some((at, data, n, kept + at % PAGE, true));
                 }
                 let old = before.get_mut(&tile)?;
-                Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE))
+                Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE, false))
             })
             .collect();
+        let eager: Vec<(usize, usize, usize, usize)> = if lazy {
+            self.sparse_owe(&work, submission)
+        } else {
+            work.iter().map(|&(at, data, n, old, _)| (at, data, n, old)).collect()
+        };
         let written = std::sync::atomic::AtomicUsize::new(0);
-        crate::host::in_parallel(&work, 8, |chunk| {
+        crate::host::in_parallel(&eager, 8, |chunk| {
             let mut title: Option<Vec<u8>> = None;
             for &(at, data, n, old) in chunk {
                 // SAFETY: the tile's mapping; this tile is this thread's alone.
@@ -2370,12 +2398,16 @@ impl Shadow {
                 // the locks held above; this thread's alone.
                 let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
                 #[cfg(feature = "diagnostics")]
-                SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+                if !lazy {
+                    SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+                }
                 if host == old {
                     continue;
                 }
                 #[cfg(feature = "diagnostics")]
-                SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+                if !lazy {
+                    SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+                }
                 let remaps = crate::remap::held();
                 withhold(&remaps, submission, at, n, |a, b| {
                     host[a..b].copy_from_slice(&old[a..b]);
@@ -2411,6 +2443,59 @@ impl Shadow {
             compared.slots.clear();
         }
         written
+    }
+
+    /// Lazy copy-back of `work` (see [`Shadow::sparse_back`]): the bytes
+    /// the GPU changed, by tile; pages declared while owed add them to what
+    /// they owe, the others are left owed now. Returns the tiles that
+    /// cannot be, to merge now.
+    #[allow(clippy::type_complexity)]
+    fn sparse_owe(
+        &self,
+        work: &[(usize, usize, usize, usize, bool)],
+        submission: u64,
+    ) -> Vec<(usize, usize, usize, usize)> {
+        let found: Vec<Mutex<Option<crate::lazy::Mask>>> = work.iter().map(|_| Mutex::new(None)).collect();
+        let items: Vec<usize> = (0..work.len()).collect();
+        crate::host::in_parallel(&items, 8, |chunk| {
+            for &i in chunk {
+                let (at, data, n, old, _) = work[i];
+                // SAFETY: the tile's mapping and its snapshot, this thread's
+                // alone (see `sparse_back`).
+                let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
+                // SAFETY: as above.
+                let old = unsafe { std::slice::from_raw_parts(old as *const u8, n) };
+                #[cfg(feature = "diagnostics")]
+                SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+                if host == old {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+                let remaps = crate::remap::held();
+                withhold(&remaps, submission, at, n, |a, b| {
+                    host[a..b].copy_from_slice(&old[a..b]);
+                });
+                let mut mask = crate::lazy::mask();
+                if crate::lazy::differ(&mut mask, at % PAGE, host, old) {
+                    *found[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(mask);
+                }
+            }
+        });
+        let root = self.root_key();
+        let (mut owe, mut which) = (Vec::new(), Vec::new());
+        for (&(at, data, n, old, kept), found) in work.iter().zip(found) {
+            let Some(mask) = found.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+                continue;
+            };
+            if kept {
+                crate::lazy::found(submission, at, mask);
+            } else {
+                owe.push(crate::lazy::Owe { at: at - at % PAGE, tile: data & !(PAGE - 1), root, mask });
+                which.push((at, data, n, old));
+            }
+        }
+        crate::lazy::owe(owe).into_iter().zip(which).filter(|(owed, _)| !owed).map(|(_, w)| w).collect()
     }
 }
 
