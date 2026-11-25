@@ -7656,8 +7656,10 @@ impl<'a> Lower<'a> {
                     self.as_int(f)
                 } else if f16 {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let f = self.half_modifiers(inst, f);
                     let lo = to_f16(self, f);
-                    self.low_half(inst, reg, lo)
+                    // op_sel[3] picks the destination half; the other is kept.
+                    return self.write_half(inst, lo, None);
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
                     let h = 2 * attribute.channel;
@@ -7820,18 +7822,21 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
-    /// results keep the register's high half (GFX10).
-    fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
-        let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) => o,
-            _ => self.s.m.i32(0),
+    /// VOP3 output modifiers of an f16 result still in f32: omod, then
+    /// clamp, so the conversion to f16 rounds once.
+    fn half_modifiers(&mut self, inst: &Inst, mut f: V) -> V {
+        let Fields::Valu(v) = &inst.fields else {
+            return f;
         };
-        let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
-        let old = self.s.m.bin(c, Bin::And, old, high);
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        self.s.m.bin(c, Bin::Or, old, x)
+        if v.omod != 0 {
+            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+            let k = self.s.m.f32(factor.to_bits());
+            f = self.s.m.bin(self.cur, Bin::Mul, f, k);
+        }
+        if v.clamp {
+            f = self.unary(7, f);
+        }
+        f
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {

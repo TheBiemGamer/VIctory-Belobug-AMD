@@ -2735,6 +2735,53 @@ mod packed_half_tests {
         }
     }
 
+    /// v_interp_p2_f16 with op_sel[3] writes the high half of its
+    /// destination, and its omod and clamp apply. Read through
+    /// `dxc -dumpbin` (`VICTORY_PC_DXC`, else the Windows SDK's); skipped
+    /// without one.
+    #[test]
+    fn interpolated_f16_writes_the_op_sel_half_with_modifiers() {
+        let dxc = std::env::var_os("VICTORY_PC_DXC").map(std::path::PathBuf::from);
+        #[cfg(windows)]
+        let dxc = dxc.or_else(|| Some(validator::Validator::default_path()?.with_file_name("dxc.exe")));
+        let Some(dxc) = dxc.filter(|p| p.exists()) else {
+            return eprintln!("no dxc; DXIL check skipped");
+        };
+        // w0 bit 14: op_sel[3]; bit 15: clamp. w1 bits 27-28: omod.
+        let dump = |w0: u32, w1: u32| {
+            let words = [
+                0xD742_0002, // v_interp_p1ll_f16 v2, v0, attr1.y
+                0x0002_0041,
+                0xD75A_0002 | w0, // v_interp_p2_f16 v2, v1, attr1.y, v2
+                0x040A_0241 | w1,
+                0xF800_180F, // exp mrt0 v2, v2, v2, v2 done vm
+                0x0202_0202,
+                0xBF81_0000, // s_endpgm
+            ];
+            let dxil = pixel(&words).unwrap().dxil;
+            let file = std::env::temp_dir()
+                .join(format!("victory-interp-{}-{w0:x}-{w1:x}.dxil", std::process::id()));
+            std::fs::write(&file, dxil).unwrap();
+            let out = std::process::Command::new(&dxc)
+                .arg("-dumpbin")
+                .arg(&file)
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(&file);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let low = dump(0, 0);
+        let high = dump(1 << 14 | 1 << 15, 1 << 27);
+        let count = |text: &str, what: &str| text.matches(what).count();
+        assert!(low.contains("-65536"), "a low write keeps the high half");
+        assert!(count(&high, "shl i32") > count(&low, "shl i32"), "op_sel[3]");
+        assert!(high.contains("65535"), "a high write keeps the low half");
+        assert!(count(&high, "2.000000e+00") > count(&low, "2.000000e+00"), "omod");
+        let clamp = "dx.op.unary.f32(i32 7";
+        assert!(count(&high, clamp) > count(&low, clamp), "clamp");
+    }
+
     #[test]
     fn signature_accepts_known_min_precision_and_rejects_unknown() {
         let base = SigElement {

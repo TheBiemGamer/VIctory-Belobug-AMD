@@ -1375,7 +1375,7 @@ impl Lower<'_> {
     /// Writes a 16-bit result (low bits of `x`) into the destination's low
     /// half, or its high half with op_sel bit 3 (or an SDWA WORD_1 select);
     /// the other half is kept (GFX10).
-    fn write_half(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
+    pub(super) fn write_half(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
