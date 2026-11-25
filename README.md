@@ -135,8 +135,6 @@ The first launch after a build translates every shader and builds about
   fork has only been run on Windows 11.
 - One test fails on this machine, before and after this update:
   `list::tests::lists_are_cut_at_waits_that_follow_work`.
-- `crates/victory-shader/src/emit/lower.rs` is larger than the size limit of
-  `cargo xtask policy`; it is source code, not an asset.
 - Many changes are specific to this title and this GPU, and some are marked
   `shortcut:` in the code where they approximate what the console does.
 
