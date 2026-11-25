@@ -694,8 +694,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            // shortcut: not between textures without their largest mips.
-            if crate::resource::skipped_mips(dst) + crate::resource::skipped_mips(src) > 0 {
+            // shortcut: not between textures without their largest mips, or self-copy.
+            if to == from
+                || crate::resource::skipped_mips(dst) + crate::resource::skipped_mips(src) > 0
+            {
                 return;
             }
             if crate::texture::title_written(from) {
