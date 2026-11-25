@@ -1951,10 +1951,6 @@ impl HostHeap {
         Some(slot)
     }
 
-    /// The view host slot `index` was made from, in a few words, with the
-    /// title and host addresses of a buffer view (diagnostics). "null" for
-    /// a slot never made or left null.
-    #[cfg(feature = "diagnostics")]
     /// What a slot views and how it was made, for the device-removed report.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn report_slot(&self, index: u32) -> String {
@@ -1991,7 +1987,10 @@ impl HostHeap {
         text
     }
 
-    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    /// The view host slot `index` was made from, in a few words, with the
+    /// title and host addresses of a buffer view (diagnostics). "null" for
+    /// a slot never made or left null.
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
         let key = *self
             .made

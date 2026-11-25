@@ -116,9 +116,8 @@ unsafe impl Sync for Host {}
 /// 2026-11-24, RX 7600).
 static RETIRED: Mutex<std::collections::VecDeque<Retired>> =
     Mutex::new(std::collections::VecDeque::new());
-/// Submissions started and finished (waited for).
+/// Submissions started.
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Presented host frames a retired object is also kept for. Worker threads
 /// record lists ahead of submission and a title frame spans many
@@ -1137,7 +1136,6 @@ impl Host {
             }
         }
         if last_sub != 0 {
-            FINISHED.fetch_max(last_sub, Ordering::AcqRel);
             bury(last_sub);
         }
     }
@@ -1374,6 +1372,7 @@ impl Host {
                 continue;
             }
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
             // SAFETY: closed lists.
             unsafe { self.queue.ExecuteCommandLists(group) };
@@ -1430,7 +1429,6 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (i, started);
         }
         if let Some(after) = card_after.take() {
             #[cfg(feature = "diagnostics")]
@@ -1442,7 +1440,6 @@ impl Host {
                 card_after_ran = true;
             }
         }
-        let _ = &firsts;
         if async_signalled {
             if let Some(plan) = card_plan {
                 plan.clear_pending();
@@ -1464,7 +1461,6 @@ impl Host {
             return;
         }
         drop(early);
-        FINISHED.fetch_max(this_submission, Ordering::AcqRel);
         bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);

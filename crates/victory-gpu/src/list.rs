@@ -1659,7 +1659,7 @@ mod state {
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`. With an
     /// indirect address the group counts are in GPU memory there, run as
-    /// indirect execution of one mesh dispatch (behind the same switch).
+    /// indirect execution of one mesh dispatch.
     /// Inferred, not documented: the arguments are those of a PC indirect
     /// mesh dispatch (D3D12_DISPATCH_MESH_ARGUMENTS, three 32-bit group
     /// counts, as the title's mesh dispatch signatures have) and `x` is then
@@ -1681,12 +1681,10 @@ mod state {
             return;
         }
         let mut ran = false;
-        if super::indirect_on() {
-            super::hoist(this);
-            with_state(this, |list, s| {
-                ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
-            });
-        }
+        super::hoist(this);
+        with_state(this, |list, s| {
+            ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
+        });
         if !ran {
             if let Some(list) = super::host_list(this) {
                 list.missed_draw();
@@ -1748,14 +1746,6 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
-/// Whether the title's indirect draws and dispatches run on the host:
-/// always now that their arguments are clamped and budgeted
-/// (`crate::indirect`) and pipelines are made off the render thread.
-#[cfg(windows)]
-fn indirect_on() -> bool {
-    true
-}
-
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1782,8 +1772,7 @@ extern "system" fn execute_indirect(
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
-    if indirect_on()
-        && let ([[kind, ..]], Some(address)) = (args, address)
+    if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
