@@ -691,6 +691,16 @@ impl Layout {
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
         }
+        // Rows are mostly runs of one length (8, 16 or 32 bytes), the last
+        // one cut short by the width. Copying those through a constant
+        // length makes each copy a few moves instead of a `memcpy` call.
+        let (whole, last) = runs.split_at(runs.len().saturating_sub(1));
+        let same = whole.first().map_or(0, |run| run.2);
+        let same = if whole.iter().all(|run| run.2 == same) {
+            same
+        } else {
+            0
+        };
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -701,13 +711,34 @@ impl Layout {
                     copy(tiled_row as usize, linear_row, bytes);
                 } else {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    for &(tiled, linear, len) in &runs {
-                        copy(tiled_row + tiled, linear_row + linear, len);
+                    match same {
+                        8 => copy_runs::<8>(whole, tiled_row, linear_row, &mut copy),
+                        16 => copy_runs::<16>(whole, tiled_row, linear_row, &mut copy),
+                        32 => copy_runs::<32>(whole, tiled_row, linear_row, &mut copy),
+                        _ => copy_runs::<0>(whole, tiled_row, linear_row, &mut copy),
                     }
+                    copy_runs::<0>(last, tiled_row, linear_row, &mut copy);
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Visits the runs of one row, each `N` bytes long (`N` 0: as long as it is).
+#[inline(always)]
+fn copy_runs<const N: usize>(
+    runs: &[(usize, usize, usize)],
+    tiled_row: usize,
+    linear_row: usize,
+    copy: &mut impl FnMut(usize, usize, usize),
+) {
+    for &(tiled, linear, len) in runs {
+        copy(
+            tiled_row + tiled,
+            linear_row + linear,
+            if N == 0 { len } else { N },
+        );
     }
 }
 
