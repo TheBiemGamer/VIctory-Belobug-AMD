@@ -93,13 +93,14 @@ Each is described in a comment where it is read.
 
 ### How it is run here
 
-A diagnostics build (`cargo build --profile diag -p victory --features
-diagnostics`), with:
+From the repository root in PowerShell, build the diagnostics executable and
+run it with the path to your copy of the game executable:
 
-```
-VICTORY_PRESENT_TARGET=1x1:1
-VICTORY_HAIR=1
-victory run <game_scarlett_master.exe> --execute --console series-x
+```powershell
+cargo build --profile diag -p victory --features diagnostics
+$env:VICTORY_PRESENT_TARGET = '1x1:1'
+$env:VICTORY_HAIR = '1'
+.\target\diag\victory.exe run 'C:\Path To Game\game_scarlett_master.exe' --execute --console series-x
 ```
 
 The first launch after a build translates every shader and builds about
