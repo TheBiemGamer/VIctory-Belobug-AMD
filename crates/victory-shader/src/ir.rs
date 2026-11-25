@@ -77,12 +77,15 @@ pub enum Exit {
 }
 
 impl Exit {
-    pub fn successors(&self) -> Vec<usize> {
-        match *self {
-            Exit::Jump(b) => vec![b],
-            Exit::Branch { taken, not_taken } => vec![taken, not_taken],
-            Exit::End | Exit::Indirect => vec![],
-        }
+    /// The taken edge first. The passes over the graph ask at every step, so
+    /// this neither allocates nor borrows the exit.
+    pub fn successors(&self) -> impl Iterator<Item = usize> + use<> {
+        let (first, second) = match *self {
+            Exit::Jump(b) => (Some(b), None),
+            Exit::Branch { taken, not_taken } => (Some(taken), Some(not_taken)),
+            Exit::End | Exit::Indirect => (None, None),
+        };
+        first.into_iter().chain(second)
     }
 }
 
@@ -369,10 +372,21 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
     set[i / 64] >> (i % 64) & 1 != 0
 }
 
-/// In [`Reg`] order, which is also index order.
+/// In [`Reg`] order, which is also index order. Skips to the set bits, as
+/// most registers are in no set.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
-    (0..REGS)
-        .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
+    set.iter()
+        .enumerate()
+        .flat_map(|(w, &word)| {
+            let mut bits = word;
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let i = w * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    i
+                })
+            })
+        })
         .map(reg_at)
 }
 
@@ -514,8 +528,8 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     while let Some(top) = stack.last_mut() {
         let (b, i) = *top;
         top.1 += 1;
-        match blocks[b].exit.successors().get(i) {
-            Some(&s) if !seen[s] => {
+        match blocks[b].exit.successors().nth(i) {
+            Some(s) if !seen[s] => {
                 seen[s] = true;
                 stack.push((s, 0));
             }
@@ -691,8 +705,8 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         let mut seen = vec![false; blocks.len()];
         let mut stack = vec![from];
         while let Some(b) = stack.pop() {
-            let next = if forward {
-                blocks[b].exit.successors()
+            let next: Vec<usize> = if forward {
+                blocks[b].exit.successors().collect()
             } else {
                 blocks[b].preds.clone()
             };
@@ -1129,10 +1143,10 @@ fn effects(
         // Lanes disabled in EXEC keep the old value.
         r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
     }
-    let mut seen = Vec::with_capacity(r.len());
-    r.retain(|reg| {
-        let new = !seen.contains(reg);
-        seen.push(*reg);
+    let mut seen = [0; REGS.div_ceil(64)];
+    r.retain(|&reg| {
+        let new = !contains(&seen, reg);
+        insert(&mut seen, reg);
         new
     });
     Ok(Some((r, w)))
@@ -1491,5 +1505,39 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn a_register_read_twice_is_listed_once_in_first_use_order() {
+        let p = build_words(
+            &[
+                0x4A00_0301, // v_add_nc_u32 v0, v1, v1
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let regs: Vec<Reg> = p.blocks[0].insts[0].reads.iter().map(|r| r.0).collect();
+        assert_eq!(regs, [Reg::V(1), Reg::S(EXEC), Reg::V(0)]);
+    }
+
+    #[test]
+    fn register_sets_list_their_members_in_order() {
+        let regs = [
+            Reg::V(255),
+            Reg::S(64),
+            Reg::Scc,
+            Reg::S(0),
+            Reg::V(0),
+            Reg::S(63),
+            Reg::S(255),
+        ];
+        let mut set = [0; REGS.div_ceil(64)];
+        assert_eq!(members(&set).count(), 0);
+        for reg in regs {
+            insert(&mut set, reg);
+        }
+        let mut sorted = regs;
+        sorted.sort();
+        assert_eq!(members(&set).collect::<Vec<_>>(), sorted);
     }
 }
