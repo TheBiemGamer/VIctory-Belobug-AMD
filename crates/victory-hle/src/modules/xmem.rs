@@ -401,6 +401,10 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// The views of each section (by its pointer), by address: the first
+    /// page they show and how many. Kept in step with `views` by
+    /// `insert_view` and `remove_view`.
+    section_views: HashMap<usize, BTreeMap<usize, (usize, usize)>>,
     /// Reservations that take physical pages: start, length.
     reservations: Vec<(usize, usize)>,
     /// Of them, those shown whole by one view: start, length, the section.
@@ -416,6 +420,33 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
         ..Default::default()
     })
 });
+
+impl Physical {
+    fn insert_view(&mut self, at: usize, len: usize, slice: Slice) {
+        // Views do not overlap, but one at `at` would be replaced.
+        self.remove_view(at);
+        let section = Arc::as_ptr(&slice.section) as usize;
+        let shown = (slice.index, len / PAGE);
+        let views = self.section_views.entry(section).or_default();
+        views.insert(at, shown);
+        self.views.insert(at, (len, slice));
+    }
+
+    fn remove_view(&mut self, at: usize) -> Option<(usize, Slice)> {
+        let (len, slice) = self.views.remove(&at)?;
+        self.forget_view(at, Arc::as_ptr(&slice.section) as usize);
+        Some((len, slice))
+    }
+
+    fn forget_view(&mut self, at: usize, section: usize) {
+        if let Some(views) = self.section_views.get_mut(&section) {
+            views.remove(&at);
+            if views.is_empty() {
+                self.section_views.remove(&section);
+            }
+        }
+    }
+}
 
 fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
@@ -603,9 +634,14 @@ pub(crate) fn physical_written(pages: &[usize], offset: usize, len: usize) {
         let mut shown = Vec::new();
         for (slice, n) in &runs {
             let (from, to) = (slice.index, slice.index + n);
-            for (&base, (size, view)) in &physical.views {
-                let (first, last) = (view.index, view.index + size / PAGE);
-                if first < to && from < last && Arc::ptr_eq(&view.section, &slice.section) {
+            // Only the views of the run's section, as the whole map would
+            // give them (by address).
+            let bases = physical
+                .section_views
+                .get(&(Arc::as_ptr(&slice.section) as usize));
+            for (&base, &(first, pages)) in bases.into_iter().flatten() {
+                let last = first + pages;
+                if first < to && from < last {
                     let (a, b) = (from.max(first), to.min(last));
                     shown.push((base + (a - first) * PAGE, (b - a) * PAGE));
                 }
@@ -762,7 +798,7 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
             }
             tracing::info!(at = format_args!("{at:#x}"), len, "a reservation of physical pages shown whole");
             victory_gpu::title_memory_remapped(at, len);
-            physical.views.insert(at, (len, all));
+            physical.insert_view(at, len, all);
             physical.whole.push((at, len, first.section.clone()));
             (at, len, first.section.clone())
         }
@@ -930,7 +966,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     for (at, len, part) in made {
         // New contents, read-write: the GPU side's copies no longer guard it.
         victory_gpu::title_memory_remapped(at, len);
-        physical.views.insert(at, (len, part));
+        physical.insert_view(at, len, part);
     }
     true
 }
@@ -1082,7 +1118,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
-        let Some((size, slice)) = physical.views.remove(&at) else {
+        let Some((size, slice)) = physical.remove_view(at) else {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
