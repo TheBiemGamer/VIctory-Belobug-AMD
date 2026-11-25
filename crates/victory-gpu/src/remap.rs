@@ -107,8 +107,9 @@ pub(crate) fn finished(submission: u64) {
     }
 }
 
-/// Holds remaps off: a remap is recorded before the unmap, so bytes checked
-/// and written under this land before it.
+/// Holds remaps off while a page is checked and written. shortcut: a map is
+/// recorded after it and an unmap before it with no lock held across it, so a
+/// submission starting in between (microseconds) is not masked.
 pub(crate) struct Held(RwLockReadGuard<'static, Remaps>);
 
 pub(crate) fn held() -> Held {
