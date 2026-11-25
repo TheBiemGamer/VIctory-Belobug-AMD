@@ -12,13 +12,18 @@
 //!    graphics state); the next run hands those to the workers at
 //!    creation, during loading.
 //!
-//! All library calls are serialised: the interface does not promise that
-//! stores, loads and serialising may overlap.
+//! The library is free-threaded but for loads of one pipeline on several
+//! threads (`ID3D12Device1::CreatePipelineLibrary`, "Thread Safety"), so
+//! pipelines of different names load at the same time: an AMD driver
+//! compiles what its own cache lacks inside the load, for seconds, and
+//! loaded one at a time they kept eight workers to one core. Stores and
+//! serialising keep the lock: the size asked for must still be right when
+//! the bytes are written.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -44,9 +49,65 @@ struct Library {
     added: u64,
 }
 
-// SAFETY: D3D12 objects are free-threaded; every call is made under the
-// mutex that holds the library.
+// SAFETY: D3D12 objects are free-threaded (a pipeline library with the
+// exception `NAMES` takes care of).
 unsafe impl Send for Library {}
+
+/// Names one thread at a time holds.
+struct Names {
+    held: Mutex<Option<HashSet<String>>>,
+    released: Condvar,
+}
+
+/// A name held until this is dropped.
+struct Held<'a> {
+    names: &'a Names,
+    name: &'a str,
+}
+
+impl Names {
+    const fn new() -> Names {
+        Names {
+            held: Mutex::new(None),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Holds `name`, once no other thread does.
+    fn hold<'a>(&'a self, name: &'a str) -> Held<'a> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while held.as_ref().is_some_and(|h| h.contains(name)) {
+            held = self.released.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.get_or_insert_default().insert(name.to_owned());
+        Held { names: self, name }
+    }
+
+    /// Lets go of `name` for a thread that holds it and never runs on (its
+    /// compile crashed or was stopped).
+    fn abandon(&self, name: &str) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = held.as_mut() {
+            h.remove(name);
+        }
+        drop(held);
+        self.released.notify_all();
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let mut held = self.names.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = held.as_mut() {
+            h.remove(self.name);
+        }
+        drop(held);
+        self.names.released.notify_all();
+    }
+}
+
+/// Pipelines being loaded, or made and stored.
+static NAMES: Names = Names::new();
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
@@ -125,9 +186,17 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// Pipelines a driver's compiler crashed on (names, one per line).
 const CRASHED_FILE: &str = "crashed.txt";
 
-/// The pipeline named `name` is left out from the next run on.
+/// Pipelines noted in this run: left out for the rest of it too.
+static NOTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// The pipeline named `name` is left out from now on.
 fn note_crashed(name: &str) {
     use std::io::Write;
+    NOTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_default()
+        .insert(name.to_owned());
     let Some(dir) = DIR.get() else { return };
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -149,6 +218,11 @@ fn crashed(name: &str) -> bool {
                 .unwrap_or_default()
         })
         .contains(name)
+        || NOTED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|n| n.contains(name))
 }
 
 thread_local! {
@@ -255,7 +329,7 @@ fn suspend(id: u32) -> bool {
 }
 
 /// Notes pipelines the driver's compiler has worked on for long
-/// ([`ENDLESS`]): they are left out from the next run on. AMD's never ends
+/// ([`ENDLESS`]): they are left out from now on. AMD's never ends
 /// some of the world's ray tracing programs, and takes memory all the while
 /// (16 GB in two minutes), so their threads are stopped.
 fn endless(name: &str, begins: bool) {
@@ -317,15 +391,28 @@ fn endless(name: &str, begins: bool) {
                     };
                     for (name, id) in long {
                         let stopped = suspend(id);
+                        // Caught, the thread may be on another compile by now.
+                        let name = if stopped {
+                            AT_WORK
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .iter()
+                                .find(|w| w.2 == id)
+                                .map_or(name, |w| w.0.clone())
+                        } else {
+                            name
+                        };
+                        // Noted before its waiters wake, or one compiles it again.
+                        note_crashed(&name);
                         if stopped {
+                            NAMES.abandon(&name);
                             super::make::worker_lost(id);
                         }
                         tracing::error!(
                             name,
                             stopped,
-                            "the driver's compiler does not end a pipeline: it is left out from the next run on"
+                            "the driver's compiler does not end a pipeline: it is left out from now on"
                         );
-                        note_crashed(&name);
                         noted.push(name);
                     }
                 }
@@ -356,9 +443,10 @@ unsafe extern "system" fn compiler_crashed(
     {
         return 0; // not ours
     }
-    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
+    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out from now on");
     note_crashed(&name);
     endless(&name, false);
+    NAMES.abandon(&name);
     // SAFETY: a plain call.
     let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
     LOST.lock().unwrap_or_else(|e| e.into_inner()).push(id);
@@ -368,7 +456,9 @@ unsafe extern "system" fn compiler_crashed(
 }
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored.
+/// there with the same description, else made by `create` and stored. A
+/// name asked for by several threads is loaded or made by one at a time
+/// (the others then find it in the library); different names overlap.
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
@@ -387,7 +477,20 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
+    let _held = NAMES.hold(name);
+    // A holder before this one may have crashed or been stopped on it.
+    if crashed(name) {
+        // E_FAIL.
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
+    }
+    // The interface alone under the lock: loads take up to seconds. Its
+    // blob lives as long as the library, which is never dropped.
+    let loads = library
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .library
+        .clone();
+    if let Ok(pso) = load(&loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
@@ -528,6 +631,167 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    #[test]
+    fn different_names_are_held_at_the_same_time() {
+        static NAMES: Names = Names::new();
+        // Each thread holds its name until every thread holds its own.
+        let all = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let all = &all;
+                s.spawn(move || {
+                    let name = format!("pipeline {i}");
+                    let _held = NAMES.hold(&name);
+                    all.wait();
+                });
+            }
+        });
+        assert!(NAMES.held.lock().unwrap().as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_name_is_held_by_one_thread_at_a_time() {
+        static NAMES: Names = Names::new();
+        static INSIDE: AtomicU64 = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..500 {
+                        let _held = NAMES.hold("pipeline");
+                        assert_eq!(INSIDE.fetch_add(1, Ordering::SeqCst), 0);
+                        std::hint::spin_loop();
+                        INSIDE.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        // A holder that panics lets go of it.
+        let panicked = std::thread::spawn(|| {
+            let _held = NAMES.hold("pipeline");
+            panic!("on purpose");
+        });
+        assert!(panicked.join().is_err());
+        drop(NAMES.hold("pipeline"));
+    }
+
+    /// A library's pipelines load on many threads at once, each with its
+    /// own description (a load with another's is refused), while others are
+    /// stored and the library is serialised.
+    #[test]
+    fn pipelines_load_on_many_threads_at_once() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+        const N: usize = 48;
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
+            return; // no host GPU here
+        };
+        let shader = |i: usize| {
+            let source = format!(
+                "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
+                 [RootSignature(RS)] [numthreads(1, 1, 1)] void main() {{ b.Store(0, b.Load(4) * {i} + {i}); }}"
+            );
+            let mut blob = None;
+            // SAFETY: the source outlives the call; the blob is read within it.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    None,
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+                .ok()?;
+                let blob = blob?;
+                Some(
+                    std::slice::from_raw_parts(
+                        blob.GetBufferPointer().cast::<u8>(),
+                        blob.GetBufferSize(),
+                    )
+                    .to_vec(),
+                )
+            }
+        };
+        let Some(codes) = (0..2 * N).map(shader).collect::<Option<Vec<_>>>() else {
+            return; // no shader compiler here
+        };
+        // SAFETY: the code holds its root signature.
+        let root: ID3D12RootSignature =
+            unsafe { device.CreateRootSignature(0, &codes[0]) }.unwrap();
+        struct Shared(ID3D12Device1, ID3D12RootSignature, ID3D12PipelineLibrary1);
+        // SAFETY: D3D12 objects are free-threaded.
+        unsafe impl Sync for Shared {}
+        impl Shared {
+            fn desc(&self, code: &[u8]) -> D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    // SAFETY: a borrowed pointer the description never releases.
+                    pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                }
+            }
+            fn store(&self, i: usize, code: &[u8]) {
+                let name = HSTRING::from(format!("p{i}"));
+                // SAFETY: the description points at live data.
+                unsafe {
+                    let pso: ID3D12PipelineState =
+                        self.0.CreateComputePipelineState(&self.desc(code)).unwrap();
+                    self.2.StorePipeline(&name, &pso).unwrap();
+                }
+            }
+            fn load(&self, i: usize, code: &[u8]) -> windows::core::Result<ID3D12PipelineState> {
+                let name = HSTRING::from(format!("p{i}"));
+                // SAFETY: as above.
+                unsafe { self.2.LoadComputePipeline(&name, &self.desc(code)) }
+            }
+            fn serialized(&self) -> Vec<u8> {
+                // SAFETY: a buffer of the size asked for; nothing is stored
+                // meanwhile.
+                unsafe {
+                    let mut blob = vec![0; self.2.GetSerializedSize()];
+                    self.2.Serialize(&mut blob).unwrap();
+                    blob
+                }
+            }
+        }
+        let first = open(&device, Vec::new()).expect("an empty library");
+        let made = Shared(device.clone(), root.clone(), first.library.clone());
+        (0..N).for_each(|i| made.store(i, &codes[i]));
+        let again = open(&device, made.serialized()).expect("the library again");
+        let shared = Shared(device, root, again.library.clone());
+        let stores = Mutex::new(());
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let (shared, codes, stores) = (&shared, &codes, &stores);
+                s.spawn(move || {
+                    for i in (t..N).step_by(8) {
+                        shared.load(i, &codes[i]).expect("a stored pipeline");
+                        assert!(
+                            shared.load(i, &codes[(i + 1) % N]).is_err(),
+                            "another description"
+                        );
+                        assert!(shared.load(N + i, &codes[N + i]).is_err(), "not stored yet");
+                        let _one = stores.lock().unwrap();
+                        shared.store(N + i, &codes[N + i]);
+                        shared.serialized();
+                    }
+                });
+            }
+        });
+        for (i, code) in codes.iter().enumerate() {
+            shared.load(i, code).expect("every pipeline");
+        }
     }
 
     #[test]
