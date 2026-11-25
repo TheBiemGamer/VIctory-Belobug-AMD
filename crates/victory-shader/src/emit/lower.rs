@@ -1253,9 +1253,11 @@ impl<'a> Lower<'a> {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            // Lane n writes only vertex and primitive n (`mesh_thread`): more
+            // than the group's lanes would only count against the host's 32 KiB.
             s.mesh = Some(super::shader::Mesh {
-                max_vertices: ms.max_vertices,
-                max_primitives: ms.max_primitives,
+                max_vertices: ms.max_vertices.min(ms.threads),
+                max_primitives: ms.max_primitives.min(ms.threads),
                 topology: ms.topology,
             });
             // Barriers order the lanes' LDS accesses; the console's

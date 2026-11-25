@@ -2913,4 +2913,45 @@ mod pr306_tests {
         #[cfg(windows)]
         validate_if_available(&ps.dxil);
     }
+
+    /// A mesh group of 64 lanes writes at most 64 vertices and primitives
+    /// (lane n its own), so declaring the console's maxima of 256 only
+    /// counts against the host's 32 KiB: nine 4-column outputs fit for 64.
+    #[test]
+    fn mesh_maxima_past_the_group_are_not_declared() {
+        let words = [
+            0x7E00_0280u32, // v_mov_b32 v0, 0
+            0xF800_0941,    // exp prim v0 done
+            0x0000_0000,
+            0xF800_08CF, // exp pos0 v0, v0, v0, v0 done
+            0x0000_0000,
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 64,
+                max_vertices: 256,
+                max_primitives: 256,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut elements = vec![sig_elem("SV_Position", 0, 3, 9, Some(0), 0, 4)];
+        elements.extend((0..8).map(|k| sig_elem("TEXCOORD", k, 0, 9, Some(k + 1), 0, 4)));
+        let osg1 = container::signature(&elements, false);
+        let ms = emit_synthetic(&[(FourCC::OSG1, &osg1)], &native).unwrap();
+        // PSV0's mesh info: the vertex and primitive maxima the host takes.
+        let c = Container::parse(&ms.dxil).unwrap();
+        let info = &c.part(FourCC::PSV0).unwrap().data[4..];
+        let half = |at: usize| u16::from_le_bytes([info[at], info[at + 1]]);
+        assert_eq!((half(12), half(14)), (64, 64));
+    }
 }
